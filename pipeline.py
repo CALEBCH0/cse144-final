@@ -1,69 +1,53 @@
 import argparse
 import os
+import time
 
 import numpy as np
 import torch
 from datasets import load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import StratifiedKFold
-from torchvision.transforms import (
-    CenterCrop,
-    Compose,
-    Lambda,
-    Normalize,
-    RandomHorizontalFlip,
-    RandomResizedCrop,
-    Resize,
-    ToTensor,
+from transformers import TrainingArguments, set_seed
+
+from config import (
+    BATCH_SIZE,
+    GPU_MEMORY_FRACTION,
+    LEARNING_RATE,
+    LLRD_FACTOR,
+    LORA_R,
+    N_FOLDS,
+    NUM_EPOCHS,
+    PROGRESSIVE_UNFREEZE_EPOCH,
+    SEED,
+    SELECTED_MODELS,
+    TRAIN_DIR,
+    TTA_AUGMENTS,
+    UNFREEZE_BLOCKS,
+    USE_COLOR_JITTER,
+    USE_CUTMIX,
+    USE_ENSEMBLE,
+    USE_LLRD,
+    USE_LORA,
+    USE_MIXUP,
+    USE_PROGRESSIVE_UNFREEZE,
+    USE_RANDAUGMENT,
+    USE_RANDOM_ERASING,
+    USE_TTA,
 )
-from transformers import TimmWrapperImageProcessor, Trainer, TrainingArguments, set_seed
-
 from models import MODELS
-
-SELECTED_MODELS = [
-    "dinov2",
-    "convnext",
-    "vit",
-]
-
-GPU_MEMORY_FRACTION = 0.85
-
-SEED = 42
-TRAIN_DIR = "data/train"
-NUM_EPOCHS = 10
-BATCH_SIZE = 32
-LEARNING_RATE = 5e-5
-N_FOLDS = 5
-
-
-class _Transform:
-    def __init__(self, tf):
-        self.tf = tf
-
-    def __call__(self, batch):
-        batch["pixel_values"] = [self.tf(img.convert("RGB")) for img in batch["image"]]
-        return batch
-
-
-def build_transforms(image_processor):
-    if isinstance(image_processor, TimmWrapperImageProcessor):
-        _train_tf = image_processor.train_transforms
-        _val_tf = image_processor.val_transforms
-    else:
-        if "shortest_edge" in image_processor.size:
-            size = image_processor.size["shortest_edge"]
-        else:
-            size = (image_processor.size["height"], image_processor.size["width"])
-
-        if hasattr(image_processor, "image_mean") and hasattr(image_processor, "image_std"):
-            normalize = Normalize(mean=image_processor.image_mean, std=image_processor.image_std)
-        else:
-            normalize = Lambda(lambda x: x)
-
-        _train_tf = Compose([RandomResizedCrop(size), RandomHorizontalFlip(), ToTensor(), normalize])
-        _val_tf = Compose([Resize(size), CenterCrop(size), ToTensor(), normalize])
-
-    return _Transform(_train_tf), _Transform(_val_tf)
+from resulter import build_run_config_lines, export_results, print_results
+from transforms import build_transforms
+from utils import (
+    CustomTrainer,
+    CutMixCollator,
+    MixupCollator,
+    MixupCutMixCollator,
+    ProgressiveUnfreezeCallback,
+    apply_freeze,
+    apply_lora,
+    ensemble_predict,
+    predict_with_tta,
+)
 
 
 def collate_fn(examples):
@@ -119,12 +103,30 @@ def main():
         print(f"{'='*60}")
 
         image_processor = model_cfg["get_processor"]()
-        train_tf, val_tf = build_transforms(image_processor)
+        train_tf, val_tf = build_transforms(
+            image_processor,
+            use_color_jitter=USE_COLOR_JITTER,
+            use_randaugment=USE_RANDAUGMENT,
+            use_random_erasing=USE_RANDOM_ERASING,
+        )
+
+        if USE_MIXUP and USE_CUTMIX:
+            data_collator = MixupCutMixCollator(num_labels, mixup_alpha=0.2, cutmix_alpha=1.0)
+        elif USE_CUTMIX:
+            data_collator = CutMixCollator(num_labels, alpha=1.0)
+        elif USE_MIXUP:
+            data_collator = MixupCollator(num_labels, alpha=0.2)
+        else:
+            data_collator = collate_fn
 
         fold_metrics = []
         fold_per_class_f1 = []
         fold_per_class_precision = []
         fold_per_class_recall = []
+        fold_models = []
+        fold_train_sec = []
+        fold_eval_sec = []
+        _fmt = lambda s: f"{s/60:.1f}m" if s >= 60 else f"{s:.0f}s"
 
         for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
             print(f"\n  -- Fold {fold_idx + 1}/{N_FOLDS} --")
@@ -134,12 +136,17 @@ def main():
 
             model = model_cfg["get_model"](num_labels, label2id, id2label)
 
-            if model_cfg.get("freeze_backbone"):
-                for pname, param in model.named_parameters():
-                    if "classifier" not in pname:
-                        param.requires_grad = False
+            if USE_LORA:
+                model = apply_lora(model, name, r=LORA_R)
                 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-                print(f"  Frozen backbone — {trainable:,} trainable params")
+                print(f"  LoRA r={LORA_R} — {trainable:,} trainable params")
+            else:
+                trainable = apply_freeze(model, name, UNFREEZE_BLOCKS)
+                print(f"  Frozen backbone — {trainable:,} trainable params (unfreeze_blocks={UNFREEZE_BLOCKS})")
+
+            callbacks = []
+            if USE_PROGRESSIVE_UNFREEZE and not USE_LORA:
+                callbacks.append(ProgressiveUnfreezeCallback(name, PROGRESSIVE_UNFREEZE_EPOCH))
 
             training_args = TrainingArguments(
                 output_dir=os.path.join(model_cfg["output_dir"], f"fold_{fold_idx}"),
@@ -162,19 +169,28 @@ def main():
                 dataloader_pin_memory=torch.cuda.is_available(),
             )
 
-            trainer = Trainer(
+            trainer = CustomTrainer(
                 model=model,
                 args=training_args,
                 train_dataset=train_fold,
                 eval_dataset=val_fold,
                 compute_metrics=compute_metrics,
                 processing_class=image_processor,
-                data_collator=collate_fn,
+                data_collator=data_collator,
+                callbacks=callbacks,
+                llrd_factor=LLRD_FACTOR if (USE_LLRD and not USE_LORA) else 1.0,
+                model_name=name,
+                use_mixup=USE_MIXUP or USE_CUTMIX,
             )
 
+            t0 = time.perf_counter()
             trainer.train()
+            train_sec = time.perf_counter() - t0
 
+            t0 = time.perf_counter()
             preds_out = trainer.predict(val_fold)
+            eval_sec = time.perf_counter() - t0
+
             preds = np.argmax(preds_out.predictions, axis=1)
             true = preds_out.label_ids
 
@@ -188,7 +204,21 @@ def main():
             fold_per_class_precision.append(precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
             fold_per_class_recall.append(recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
 
-            print(f"  Fold {fold_idx + 1} val: acc={fold_metrics[-1]['accuracy']:.4f}  f1={fold_metrics[-1]['f1']:.4f}")
+            fold_train_sec.append(train_sec)
+            fold_eval_sec.append(eval_sec)
+
+            print(f"  Fold {fold_idx + 1} val: acc={fold_metrics[-1]['accuracy']:.4f}  f1={fold_metrics[-1]['f1']:.4f}"
+                  f"  train={_fmt(train_sec)}  eval={_fmt(eval_sec)}")
+
+            if USE_TTA:
+                tta_probs = predict_with_tta(trainer, full_dataset.select(val_idx), train_tf, n_augments=TTA_AUGMENTS)
+                tta_preds = np.argmax(tta_probs, axis=1)
+                tta_acc = accuracy_score(true, tta_preds)
+                tta_f1 = f1_score(true, tta_preds, average="macro", zero_division=0)
+                print(f"  Fold {fold_idx + 1} TTA:  acc={tta_acc:.4f}  f1={tta_f1:.4f}  (delta acc {tta_acc - fold_metrics[-1]['accuracy']:+.4f})")
+
+            if USE_ENSEMBLE:
+                fold_models.append(model)
 
         mean = {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
         std  = {m: float(np.std( [f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
@@ -211,69 +241,53 @@ def main():
             },
         }
 
+        total_train = sum(fold_train_sec)
+        total_eval  = sum(fold_eval_sec)
         print(f"\n{name} CV results ({N_FOLDS} folds):")
         print(f"  {'acc':>6}: {mean['accuracy']:.4f} ± {std['accuracy']:.4f}")
         print(f"  {'prec':>6}: {mean['precision']:.4f} ± {std['precision']:.4f}")
         print(f"  {'rec':>6}: {mean['recall']:.4f} ± {std['recall']:.4f}")
         print(f"  {'f1':>6}: {mean['f1']:.4f} ± {std['f1']:.4f}")
+        print(f"  time : train {total_train/60:.1f}m total ({np.mean(fold_train_sec):.0f}s/fold)"
+              f"  |  eval {total_eval:.0f}s total ({np.mean(fold_eval_sec):.0f}s/fold)")
 
-    # ── comparison table ──────────────────────────────────────────────
-    model_names = list(results.keys())
-    print(f"\n{'='*72}")
-    print(f"MODEL COMPARISON ({N_FOLDS}-fold CV, mean ± std)")
-    print(f"{'='*72}")
-    print(f"{'model':>14} {'accuracy':>16} {'precision':>16} {'recall':>16} {'f1':>16}")
-    print("-" * 80)
-    for n in model_names:
-        m, s = results[n]["mean"], results[n]["std"]
-        print(f"{n:>14} {m['accuracy']:.4f}±{s['accuracy']:.4f}  {m['precision']:.4f}±{s['precision']:.4f}  {m['recall']:.4f}±{s['recall']:.4f}  {m['f1']:.4f}±{s['f1']:.4f}")
+        if USE_ENSEMBLE and len(fold_models) > 1:
+            print(f"\n  Running ensemble ({len(fold_models)} fold models) on full dataset...")
+            ens_logits = ensemble_predict(fold_models, full_dataset.with_transform(val_tf), collate_fn)
+            ens_preds = np.argmax(ens_logits, axis=1)
+            ens_labels = np.array(full_dataset["label"])
+            ens_acc = accuracy_score(ens_labels, ens_preds)
+            ens_f1 = f1_score(ens_labels, ens_preds, average="macro", zero_division=0)
+            print(f"  Ensemble (full train set): acc={ens_acc:.4f}  f1={ens_f1:.4f}")
 
-    best = max(model_names, key=lambda n: results[n]["mean"]["accuracy"])
-    print(f"\nBest model: {best} (mean val acc {results[best]['mean']['accuracy'] * 100:.2f}%)")
+    run_cfg = {
+        "selected_models": SELECTED_MODELS,
+        "num_epochs": NUM_EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "n_folds": N_FOLDS,
+        "seed": SEED,
+        "unfreeze_blocks": UNFREEZE_BLOCKS,
+        "use_lora": USE_LORA,
+        "lora_r": LORA_R,
+        "use_randaugment": USE_RANDAUGMENT,
+        "use_color_jitter": USE_COLOR_JITTER,
+        "use_random_erasing": USE_RANDOM_ERASING,
+        "use_mixup": USE_MIXUP,
+        "use_cutmix": USE_CUTMIX,
+        "use_llrd": USE_LLRD,
+        "llrd_factor": LLRD_FACTOR,
+        "use_progressive_unfreeze": USE_PROGRESSIVE_UNFREEZE,
+        "progressive_unfreeze_epoch": PROGRESSIVE_UNFREEZE_EPOCH,
+        "use_tta": USE_TTA,
+        "tta_augments": TTA_AUGMENTS,
+        "use_ensemble": USE_ENSEMBLE,
+    }
+    run_cfg_lines = build_run_config_lines(run_cfg)
+    print_results(results, class_names, num_labels, N_FOLDS, run_cfg_lines)
 
-    # ── per-class table ───────────────────────────────────────────────
-    col_w = 14
-    print(f"\n{'='*72}")
-    print(f"PER-CLASS F1 (mean across {N_FOLDS} folds)")
-    print(f"{'='*72}")
-    for n in model_names:
-        got_right = sum(1 for cls in class_names if results[n]["per_class"][cls]["f1"] > 0)
-        print(f"  {n}: {got_right}/{num_labels} classes with F1 > 0")
-    print()
-    print(f"{'class':<25}" + "".join(f"{n:>{col_w}}" for n in model_names))
-    print("-" * (25 + col_w * len(model_names)))
-    for cls in class_names:
-        row = f"{cls:<25}"
-        for n in model_names:
-            row += f"{results[n]['per_class'][cls]['f1']:>{col_w}.4f}"
-        print(row)
-
-    # ── export ────────────────────────────────────────────────────────
     if args.export:
-        lines = [
-            f"MODEL COMPARISON ({N_FOLDS}-fold CV, mean ± std)\n",
-            f"{'model':>14} {'accuracy':>16} {'precision':>16} {'recall':>16} {'f1':>16}\n",
-            "-" * 80 + "\n",
-        ]
-        for n in model_names:
-            m, s = results[n]["mean"], results[n]["std"]
-            lines.append(f"{n:>14} {m['accuracy']:.4f}±{s['accuracy']:.4f}  {m['precision']:.4f}±{s['precision']:.4f}  {m['recall']:.4f}±{s['recall']:.4f}  {m['f1']:.4f}±{s['f1']:.4f}\n")
-        lines.append(f"\nBest model: {best} (mean val acc {results[best]['mean']['accuracy'] * 100:.2f}%)\n")
-        lines.append(f"\n\nPER-CLASS F1 (mean across {N_FOLDS} folds)\n")
-        for n in model_names:
-            got_right = sum(1 for cls in class_names if results[n]["per_class"][cls]["f1"] > 0)
-            lines.append(f"  {n}: {got_right}/{num_labels} classes with F1 > 0\n")
-        lines.append("\n")
-        lines.append(f"{'class':<25}" + "".join(f"{n:>{col_w}}" for n in model_names) + "\n")
-        lines.append("-" * (25 + col_w * len(model_names)) + "\n")
-        for cls in class_names:
-            row = f"{cls:<25}"
-            for n in model_names:
-                row += f"{results[n]['per_class'][cls]['f1']:>{col_w}.4f}"
-            lines.append(row + "\n")
-        with open(args.export, "w") as f:
-            f.writelines(lines)
-        print(f"\nResults saved to {args.export}")
+        export_results(args.export, results, class_names, num_labels, N_FOLDS, run_cfg_lines)
 
 
 if __name__ == "__main__":

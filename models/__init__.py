@@ -58,6 +58,7 @@ MODELS = [
         "get_model": get_convnext,
         "get_processor": get_convnext_processor,
         "output_dir": "checkpoints/convnext",
+        "learning_rate": 3e-4,  # best from LR sweep (config 11: 76.27%)
     },
     {
         "name": "convnext_large",
@@ -65,6 +66,7 @@ MODELS = [
         "get_model": get_convnext_large,
         "get_processor": get_convnext_large_processor,
         "output_dir": "checkpoints/convnext_large",
+        "learning_rate": 3e-4,  # same family; apply same LR finding
     },
     {
         "name": "vit",

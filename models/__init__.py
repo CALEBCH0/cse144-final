@@ -7,6 +7,9 @@ from models.convnext_tiny import get_processor as get_convnext_tiny_processor
 from models.dinov2 import MODEL_ID as DINOV2_MODEL_ID
 from models.dinov2 import get_model as get_dinov2
 from models.dinov2 import get_processor as get_dinov2_processor
+from models.dinov2_large import MODEL_ID as DINOV2_LARGE_MODEL_ID
+from models.dinov2_large import get_model as get_dinov2_large
+from models.dinov2_large import get_processor as get_dinov2_large_processor
 from models.convnext_large import MODEL_ID as CONVNEXT_LARGE_MODEL_ID
 from models.convnext_large import get_model as get_convnext_large
 from models.convnext_large import get_processor as get_convnext_large_processor
@@ -28,6 +31,13 @@ MODELS = [
         "get_processor": get_dinov2_processor,
         "output_dir": "checkpoints/dinov2",
         "freeze_backbone": True,
+    },
+    {
+        "name": "dinov2_large",
+        "model_id": DINOV2_LARGE_MODEL_ID,
+        "get_model": get_dinov2_large,
+        "get_processor": get_dinov2_large_processor,
+        "output_dir": "checkpoints/dinov2_large",
     },
     {
         "name": "convnext_tiny",

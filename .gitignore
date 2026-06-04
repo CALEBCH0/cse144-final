@@ -4,3 +4,7 @@ __pycache__/
 .claude/
 /venv.bat
 checkpoints/
+search_results/
+*.csv
+pipeline_results.txt
+*.log

@@ -1,5 +1,7 @@
 import argparse
+import csv
 import os
+import subprocess
 import time
 
 import numpy as np
@@ -40,13 +42,16 @@ from transforms import build_transforms
 from utils import (
     CustomTrainer,
     CutMixCollator,
+    EpochAccuracyCallback,
     MixupCollator,
     MixupCutMixCollator,
     ProgressiveUnfreezeCallback,
     apply_freeze,
     apply_lora,
     ensemble_predict,
+    predict_test_images,
     predict_with_tta,
+    signal,
 )
 
 
@@ -69,7 +74,10 @@ def compute_metrics(p):
 
 def main():
     parser = argparse.ArgumentParser()
+    # parser.add_argument("--export", default="pipeline_results.txt", type=str, metavar="FILE", help="Save results to a text file")
     parser.add_argument("--export", type=str, metavar="FILE", help="Save results to a text file")
+    parser.add_argument("--submit", action="store_true", help="Submit generated submission CSV to Kaggle after training")
+    parser.add_argument("--message", type=str, default="pipeline run", metavar="MSG", help="Kaggle submission message (used with --submit)")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -101,6 +109,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Training: {name} ({model_cfg['model_id']})  [{N_FOLDS}-fold CV]")
         print(f"{'='*60}")
+        signal("model_start", model=name, folds=N_FOLDS)
 
         image_processor = model_cfg["get_processor"]()
         train_tf, val_tf = build_transforms(
@@ -120,6 +129,7 @@ def main():
             data_collator = collate_fn
 
         fold_metrics = []
+        fold_train_acc = []
         fold_per_class_f1 = []
         fold_per_class_precision = []
         fold_per_class_recall = []
@@ -144,7 +154,10 @@ def main():
                 trainable = apply_freeze(model, name, UNFREEZE_BLOCKS)
                 print(f"  Frozen backbone — {trainable:,} trainable params (unfreeze_blocks={UNFREEZE_BLOCKS})")
 
+            train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
+
             callbacks = []
+            callbacks.append(EpochAccuracyCallback(train_eval_fold, val_fold, collate_fn))
             if USE_PROGRESSIVE_UNFREEZE and not USE_LORA:
                 callbacks.append(ProgressiveUnfreezeCallback(name, PROGRESSIVE_UNFREEZE_EPOCH))
 
@@ -187,6 +200,7 @@ def main():
             trainer.train()
             train_sec = time.perf_counter() - t0
 
+            trainer.data_collator = collate_fn  # plain collator — no mixup on val/train eval
             t0 = time.perf_counter()
             preds_out = trainer.predict(val_fold)
             eval_sec = time.perf_counter() - t0
@@ -204,11 +218,23 @@ def main():
             fold_per_class_precision.append(precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
             fold_per_class_recall.append(recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
 
+            # training accuracy — evaluate on train split with val transforms (no aug)
+            train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
+            train_preds_out = trainer.predict(train_eval_fold)
+            train_acc = accuracy_score(train_preds_out.label_ids,
+                                       np.argmax(train_preds_out.predictions, axis=1))
+            fold_train_acc.append(train_acc)
+
             fold_train_sec.append(train_sec)
             fold_eval_sec.append(eval_sec)
 
-            print(f"  Fold {fold_idx + 1} val: acc={fold_metrics[-1]['accuracy']:.4f}  f1={fold_metrics[-1]['f1']:.4f}"
-                  f"  train={_fmt(train_sec)}  eval={_fmt(eval_sec)}")
+            print(f"  Fold {fold_idx + 1}: train_acc={train_acc:.4f}  val_acc={fold_metrics[-1]['accuracy']:.4f}"
+                  f"  f1={fold_metrics[-1]['f1']:.4f}  train={_fmt(train_sec)}  eval={_fmt(eval_sec)}")
+            signal("fold_done", model=name, fold=fold_idx + 1, n_folds=N_FOLDS,
+                   train_acc=round(train_acc, 4),
+                   val_acc=round(fold_metrics[-1]["accuracy"], 4),
+                   f1=round(fold_metrics[-1]["f1"], 4),
+                   train_sec=round(train_sec))
 
             if USE_TTA:
                 tta_probs = predict_with_tta(trainer, full_dataset.select(val_idx), train_tf, n_augments=TTA_AUGMENTS)
@@ -227,10 +253,15 @@ def main():
         mean_per_class_precision = np.mean(fold_per_class_precision, axis=0)
         mean_per_class_recall    = np.mean(fold_per_class_recall, axis=0)
 
+        total_train = sum(fold_train_sec)
+        total_eval  = sum(fold_eval_sec)
+
         results[name] = {
             "folds": fold_metrics,
             "mean": mean,
             "std": std,
+            "train_acc_mean": float(np.mean(fold_train_acc)),
+            "train_acc_std":  float(np.std(fold_train_acc)),
             "per_class": {
                 class_names[i]: {
                     "f1": float(mean_per_class_f1[i]),
@@ -239,15 +270,16 @@ def main():
                 }
                 for i in range(num_labels)
             },
+            "total_train_sec": total_train,
+            "total_eval_sec": total_eval,
         }
-
-        total_train = sum(fold_train_sec)
-        total_eval  = sum(fold_eval_sec)
+        signal("model_done", model=name, acc=round(mean["accuracy"], 4),
+               f1=round(mean["f1"], 4), total_min=round(total_train / 60, 1))
         print(f"\n{name} CV results ({N_FOLDS} folds):")
-        print(f"  {'acc':>6}: {mean['accuracy']:.4f} ± {std['accuracy']:.4f}")
-        print(f"  {'prec':>6}: {mean['precision']:.4f} ± {std['precision']:.4f}")
-        print(f"  {'rec':>6}: {mean['recall']:.4f} ± {std['recall']:.4f}")
-        print(f"  {'f1':>6}: {mean['f1']:.4f} ± {std['f1']:.4f}")
+        print(f"  {'acc':>6}: {mean['accuracy']:.4f} +/-{std['accuracy']:.4f}")
+        print(f"  {'prec':>6}: {mean['precision']:.4f} +/-{std['precision']:.4f}")
+        print(f"  {'rec':>6}: {mean['recall']:.4f} +/-{std['recall']:.4f}")
+        print(f"  {'f1':>6}: {mean['f1']:.4f} +/-{std['f1']:.4f}")
         print(f"  time : train {total_train/60:.1f}m total ({np.mean(fold_train_sec):.0f}s/fold)"
               f"  |  eval {total_eval:.0f}s total ({np.mean(fold_eval_sec):.0f}s/fold)")
 
@@ -259,6 +291,48 @@ def main():
             ens_acc = accuracy_score(ens_labels, ens_preds)
             ens_f1 = f1_score(ens_labels, ens_preds, average="macro", zero_division=0)
             print(f"  Ensemble (full train set): acc={ens_acc:.4f}  f1={ens_f1:.4f}")
+
+        # ── Kaggle test inference ──────────────────────────────────────────────
+        submission_models = fold_models if fold_models else [model]
+        data_root = os.path.dirname(TRAIN_DIR)
+        test_dir = os.path.join(data_root, "test")
+
+        if os.path.isdir(test_dir):
+            # Use all jpg files — Kaggle expects every image in the test dir (1036, not just 1000)
+            test_ids = sorted(
+                [f for f in os.listdir(test_dir) if f.lower().endswith(".jpg")],
+                key=lambda x: int(x.split(".")[0]),
+            )
+
+            image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
+            submission_path = f"submission_{name}.csv"
+            print(f"\n  Predicting {len(test_ids)} test images ({len(submission_models)} fold model(s))...")
+            test_preds = predict_test_images(submission_models, image_paths, val_tf)
+
+            with open(submission_path, "w", newline="") as sf:
+                writer = csv.writer(sf)
+                writer.writerow(["ID", "Label"])
+                for img_id, pred in zip(test_ids, test_preds):
+                    # class_names are alphabetically sorted folder names ("0","1","10",...)
+                    # convert internal index back to the folder name (= Kaggle's integer label)
+                    writer.writerow([img_id, int(class_names[int(pred)])])
+            print(f"  Submission saved: {submission_path}")
+
+            if args.submit:
+                print(f"  Submitting to Kaggle...")
+                result = subprocess.run(
+                    [
+                        "kaggle", "competitions", "submit",
+                        "-c", "ucsc-cse-144-spring-2026-final-project",
+                        "-f", submission_path,
+                        "-m", args.message,
+                    ],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    print(f"  {result.stdout.strip()}")
+                else:
+                    print(f"  Kaggle submission failed: {result.stderr.strip()}")
 
     run_cfg = {
         "selected_models": SELECTED_MODELS,
@@ -285,6 +359,10 @@ def main():
     }
     run_cfg_lines = build_run_config_lines(run_cfg)
     print_results(results, class_names, num_labels, N_FOLDS, run_cfg_lines)
+
+    best_model = max(results, key=lambda n: results[n]["mean"]["accuracy"]) if results else "none"
+    best_acc = results[best_model]["mean"]["accuracy"] if results else 0.0
+    signal("pipeline_done", best=best_model, acc=round(best_acc, 4), models=len(results))
 
     if args.export:
         export_results(args.export, results, class_names, num_labels, N_FOLDS, run_cfg_lines)

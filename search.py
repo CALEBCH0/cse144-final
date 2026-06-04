@@ -20,25 +20,32 @@ from utils import (
     MixupCutMixCollator,
     apply_freeze as _apply_freeze,
     apply_lora,
+    predict_test_images,
+    signal,
 )
 
 RESULTS_FILE = "search_results.csv"
+SUBMISSIONS_DIR = "search_results"
 
 # ── Configs to run ────────────────────────────────────────────────────────────
 # Set to None to run everything not yet in the CSV (full resume mode).
 # Set to a set of indices to run only those specific configs.
 # Completed configs (already in search_results.csv) are always skipped regardless.
 CONFIGS_TO_RUN = {
-    # ViT LR sweep (linear)
-    12, 13, 14, 15,
-    # ViT scheduler (cosine)
-    18, 19,
-    # ViT weight decay
-    24,
-    # ViT LLRD factors
-    28, 29, 30,
-    # Aug + collator combos (full aug stack + mixup / cutmix / mixup_cutmix)
-    35, 36, 37,
+    # DINOv2 unfreeze=2 LR sweep
+    # 44, 45, 46, 47,
+    # DINOv2 unfreeze=2 LLRD sweep
+    # 48, 49, 50,
+    # DINOv2 unfreeze=2 augmentation ablation
+    # 51, 52,
+    # ViT unfreeze=4 augmentation ablation (best ViT: LLRD=0.85)
+    # 53, 54, 55,
+    # DINOv2-Large: unfreeze depth, LR sweep, epochs, augmentation
+    # 56, 57, 58, 59, 60, 61, 62, 63,
+    # DINOv2-base: best lr + best LLRD combos, more unfreeze, longer training
+    # 64, 65, 66, 67, 68, 69,
+    # DINOv2-Large + DINOv2-base: combine best findings, overnight run
+    70, 71, 72, 73, 74, 75, 76, 77,
 }
 
 # fmt: off
@@ -128,6 +135,90 @@ SEARCH_CONFIGS = [
      "lora_r": 8},
     {"model": "vit", "unfreeze_blocks": 0, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01,
      "lora_r": 16},
+
+    # ── DINOv2 LR sweep (unfreeze=2, best depth) ──────────────────
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 3e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 3e-4,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+
+    # ── DINOv2 LLRD (unfreeze=2, lr=5e-5, cosine) ────────────────
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.65},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.75},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.85},
+
+    # ── DINOv2 augmentation (unfreeze=2, lr=5e-5, linear) ─────────
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "use_randaugment": True},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "use_color_jitter": True, "use_randaugment": True, "use_random_erasing": True},
+
+    # ── ViT augmentation (unfreeze=4, LLRD=0.85, best ViT config) ─
+    {"model": "vit", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.85,
+     "use_randaugment": True},
+    {"model": "vit", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.85,
+     "use_color_jitter": True},
+    {"model": "vit", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01, "llrd_factor": 0.85,
+     "use_color_jitter": True, "use_randaugment": True, "use_random_erasing": True},
+
+    # ── DINOv2-Large: unfreeze depth (mirror best-of-Base findings) ─
+    {"model": "dinov2_large", "unfreeze_blocks": 0,  "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2_large", "unfreeze_blocks": 2,  "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2_large", "unfreeze_blocks": 4,  "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+
+    # ── DINOv2-Large: LR sweep at unfreeze=2 ──────────────────────
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+
+    # ── DINOv2-Large: more epochs at best unfreeze ─────────────────
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 5e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "num_epochs": 20},
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 5e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "num_epochs": 30},
+
+    # ── DINOv2-Large: RandAugment at best unfreeze ────────────────
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 5e-5,  "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "use_randaugment": True},
+
+    # ── DINOv2-base: combine best lr (1e-4) + best LLRD (0.85) ────  idx 64-69
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75},
+    {"model": "dinov2", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85},
+    {"model": "dinov2", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85},
+    {"model": "dinov2", "unfreeze_blocks": 6, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85},
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 20},
+
+    # ── DINOv2-Large: combine best findings for overnight run ──────  idx 70-77
+    # A: best lr + best LLRD + best epochs (top priority)
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 30},
+    # B: same but 20ep — faster sanity check
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 20},
+    # C: alt LLRD at full power
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30},
+    # D: aug helped Large — combine with best settings
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 30, "use_randaugment": True},
+    # E: confirm LLRD effect at 30ep (no LLRD baseline)
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "num_epochs": 30},
+    # F: add LLRD to current best config (lr=5e-5, 30ep)
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 30},
+    # G: base best config + 20ep
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 20},
+    # H: base best config + 30ep
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 30},
 ]
 # fmt: on
 
@@ -135,7 +226,7 @@ NUM_EPOCHS = 10
 BATCH_SIZE = 32
 
 
-def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, label2id, id2label):
+def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, label2id, id2label, cfg_index=0):
     image_processor = model_cfg["get_processor"]()
     train_tf, val_tf = build_transforms(
         image_processor,
@@ -159,8 +250,10 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
     fold_metrics = []
     fold_train_sec = []
     fold_eval_sec = []
+    fold_models = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
+        signal("fold_start", config=cfg_index, fold=fold_idx + 1, n_folds=N_FOLDS, model=cfg["model"])
         train_fold = full_dataset.select(train_idx).with_transform(train_tf)
         val_fold   = full_dataset.select(val_idx).with_transform(val_tf)
 
@@ -175,7 +268,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
 
         training_args = TrainingArguments(
             output_dir=os.path.join(model_cfg["output_dir"], "search", f"fold_{fold_idx}"),
-            num_train_epochs=NUM_EPOCHS,
+            num_train_epochs=cfg.get("num_epochs", NUM_EPOCHS),
             per_device_train_batch_size=BATCH_SIZE,
             per_device_eval_batch_size=BATCH_SIZE,
             learning_rate=cfg["lr"],
@@ -222,6 +315,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
             raise
 
         try:
+            trainer.data_collator = collate_fn  # plain collator — no mixup on val images
             t0 = time.perf_counter()
             preds_out = trainer.predict(val_fold)
             fold_eval_sec.append(time.perf_counter() - t0)
@@ -239,11 +333,15 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
             "recall":    recall_score(true, preds, average="macro", zero_division=0),
             "f1":        f1_score(true, preds, labels=all_label_ids, average="macro", zero_division=0),
         })
+        fold_models.append(model.cpu())
         torch.cuda.empty_cache()
         tr = fold_train_sec[-1] if fold_train_sec else 0
         ev = fold_eval_sec[-1] if fold_eval_sec else 0
         print(f"    fold {fold_idx+1}: acc={fold_metrics[-1]['accuracy']:.4f}  f1={fold_metrics[-1]['f1']:.4f}"
               f"  train={tr:.0f}s  eval={ev:.0f}s  trainable={trainable:,}")
+        signal("fold_done", config=cfg_index, fold=fold_idx + 1, model=cfg["model"],
+               acc=round(fold_metrics[-1]["accuracy"], 4), f1=round(fold_metrics[-1]["f1"], 4),
+               train_sec=round(tr))
 
     if not fold_metrics:
         raise RuntimeError("All folds failed — cannot compute CV metrics")
@@ -256,6 +354,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         {m: float(np.std( [f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")},
         mean_train_sec,
         mean_eval_sec,
+        fold_models,
     )
 
 
@@ -341,29 +440,88 @@ def main():
 
             print(f"\n[{i+1}/{total}] {cfg['model']}  unfreeze={cfg['unfreeze_blocks']}  lr={cfg['lr']}  "
                   f"sched={cfg['scheduler']}  ls={cfg['label_smoothing']}  wd={cfg['weight_decay']}")
+            signal("config_start", config=i, model=cfg["model"], lr=cfg["lr"],
+                   unfreeze=cfg["unfreeze_blocks"], total=total)
 
             if cfg["model"] not in model_lookup:
-                print(f"  ✗ unknown model '{cfg['model']}' — skipping")
+                print(f"  [skip] unknown model '{cfg['model']}'")
                 continue
 
             model_cfg = model_lookup[cfg["model"]]
             try:
-                mean, std, mean_train_sec, mean_eval_sec = run_cv(
+                mean, std, mean_train_sec, mean_eval_sec, fold_models = run_cv(
                     cfg, model_cfg, full_dataset, fold_splits,
                     class_names, num_labels, label2id, id2label,
+                    cfg_index=i,
                 )
             except Exception as e:
-                print(f"  ✗ config {i} failed: {e} — skipping")
+                signal("error", config=i, model=cfg["model"], msg=str(e)[:60])
+                print(f"  [fail] config {i}: {e} — skipping")
                 torch.cuda.empty_cache()
                 continue
 
             write_row(writer, cfg, mean, std, mean_train_sec, mean_eval_sec, i, total)
             f.flush()
 
-            print(f"  → acc={mean['accuracy']:.4f}±{std['accuracy']:.4f}  f1={mean['f1']:.4f}±{std['f1']:.4f}"
-                  f"  train={mean_train_sec:.0f}s/fold  eval={mean_eval_sec:.0f}s/fold")
+            # ── generate Kaggle submission CSV ────────────────────────────
+            data_root = os.path.dirname(TRAIN_DIR)
+            test_dir = os.path.join(data_root, "test")
+            if os.path.isdir(test_dir) and fold_models:
+                os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
+                _ip = model_cfg["get_processor"]()
+                _, val_tf = build_transforms(_ip)
+                test_ids = sorted(
+                    [fn for fn in os.listdir(test_dir) if fn.lower().endswith(".jpg")],
+                    key=lambda x: int(x.split(".")[0]),
+                )
+                image_paths = [os.path.join(test_dir, fn) for fn in test_ids]
+                test_preds = predict_test_images(fold_models, image_paths, val_tf)
+                sub_path = os.path.join(SUBMISSIONS_DIR, f"config_{i}_{cfg['model']}.csv")
+                with open(sub_path, "w", newline="") as sf:
+                    writer_sub = csv.writer(sf)
+                    writer_sub.writerow(["ID", "Label"])
+                    for img_id, pred in zip(test_ids, test_preds):
+                        writer_sub.writerow([img_id, int(class_names[int(pred)])])
+                print(f"  Submission saved: {sub_path}")
+                del fold_models
+                torch.cuda.empty_cache()
 
+            print(f"  -> acc={mean['accuracy']:.4f}+/-{std['accuracy']:.4f}  f1={mean['f1']:.4f}+/-{std['f1']:.4f}"
+                  f"  train={mean_train_sec:.0f}s/fold  eval={mean_eval_sec:.0f}s/fold")
+            signal("config_done", config=i, model=cfg["model"],
+                   acc=round(mean["accuracy"], 4), f1=round(mean["f1"], 4))
+
+    signal("search_done", total=total, results=RESULTS_FILE)
     print(f"\nDone. Results saved to {RESULTS_FILE}")
+
+    # ── Summary of configs run this session ───────────────────────────────────
+    if CONFIGS_TO_RUN is not None and os.path.exists(RESULTS_FILE):
+        ran = []
+        with open(RESULTS_FILE, newline="") as f_in:
+            for row in csv.DictReader(f_in):
+                if int(row["config"]) in CONFIGS_TO_RUN:
+                    ran.append(row)
+        if ran:
+            ran.sort(key=lambda r: float(r["acc_mean"]), reverse=True)
+            print(f"\n{'='*74}")
+            print(f"  Results for this run ({len(ran)} configs), sorted by acc")
+            print(f"{'='*74}")
+            print(f"  {'cfg':>3}  {'model':<14} {'unfrz':>5} {'lr':>7} {'llrd':>5} {'extras':<16} {'acc':>7} {'f1':>7}")
+            print(f"  {'-'*70}")
+            for r in ran:
+                extras = []
+                if r.get("randaugment") == "True": extras.append("rand")
+                if r.get("color_jitter") == "True": extras.append("cj")
+                if r.get("random_erasing") == "True": extras.append("re")
+                if r.get("collator", "none") != "none": extras.append(r["collator"])
+                if r.get("lora_r", "0") != "0": extras.append(f"lora_r={r['lora_r']}")
+                cfg_entry = SEARCH_CONFIGS[int(r["config"])]
+                if cfg_entry.get("num_epochs", NUM_EPOCHS) != NUM_EPOCHS:
+                    extras.append(f"ep={cfg_entry.get('num_epochs')}")
+                print(f"  {r['config']:>3}  {r['model']:<14} {r['unfreeze_blocks']:>5} {float(r['lr']):>7.0e}"
+                      f" {float(r['llrd_factor']):>5.2f}  {' '.join(extras) if extras else '-':<16}"
+                      f" {float(r['acc_mean']):>7.4f} {float(r['f1_mean']):>7.4f}")
+            print(f"{'='*74}")
 
 
 if __name__ == "__main__":

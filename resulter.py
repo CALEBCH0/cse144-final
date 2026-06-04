@@ -4,6 +4,18 @@
 _W = 72  # column width for section headers
 
 
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as e.g. '4m32s' or '1h03m'."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
 def build_run_config_lines(cfg: dict) -> list[str]:
     """Build the RUN CONFIGURATION header block from a plain param dict.
 
@@ -67,75 +79,110 @@ def print_results(results: dict, class_names: list, num_labels: int,
     print(f"\n{'='*_W}")
     print(f"MODEL COMPARISON ({n_folds}-fold CV, mean ± std)")
     print(f"{'='*_W}")
-    print(f"{'model':>14} {'accuracy':>16} {'precision':>16} {'recall':>16} {'f1':>16}")
-    print("-" * 80)
+    print(f"{'model':>14} {'train acc':>14} {'val acc':>14} {'precision':>16} {'recall':>16} {'f1':>16} {'time':>10}")
+    print("-" * 102)
     for name in model_names:
         m, s = results[name]["mean"], results[name]["std"]
+        tr_acc  = results[name].get("train_acc_mean", float("nan"))
+        tr_std  = results[name].get("train_acc_std",  0.0)
+        dur = _fmt_duration(results[name].get("total_train_sec", 0))
         print(
-            f"{name:>14} {m['accuracy']:.4f}±{s['accuracy']:.4f}  "
+            f"{name:>14} "
+            f"{tr_acc:.4f}±{tr_std:.4f}  "
+            f"{m['accuracy']:.4f}±{s['accuracy']:.4f}  "
             f"{m['precision']:.4f}±{s['precision']:.4f}  "
             f"{m['recall']:.4f}±{s['recall']:.4f}  "
-            f"{m['f1']:.4f}±{s['f1']:.4f}"
+            f"{m['f1']:.4f}±{s['f1']:.4f}  "
+            f"{dur:>8}"
         )
 
     best = max(model_names, key=lambda n: results[n]["mean"]["accuracy"])
     print(f"\nBest model: {best} (mean val acc {results[best]['mean']['accuracy'] * 100:.2f}%)")
 
     # ── per-class F1 table ─────────────────────────────────────────────
-    col_w = 14
-    print(f"\n{'='*_W}")
-    print(f"PER-CLASS F1 (mean across {n_folds} folds)")
-    print(f"{'='*_W}")
+    col_w = 10
+    _print_per_class_table(results, class_names, num_labels, model_names, n_folds, print)
+
+
+def _print_per_class_table(results, class_names, num_labels, model_names, n_folds, emit):
+    """Per-class F1 table sorted by inter-model delta (most complementary first).
+
+    emit — callable that accepts a string (print or file.write line).
+    """
+    col_w = 10
+    emit(f"\n{'='*_W}")
+    emit(f"PER-CLASS F1 (mean across {n_folds} folds) — sorted by model spread (delta)")
+    emit(f"{'='*_W}")
     for name in model_names:
         got = sum(1 for cls in class_names if results[name]["per_class"][cls]["f1"] > 0)
-        print(f"  {name}: {got}/{num_labels} classes with F1 > 0")
-    print()
-    print(f"{'class':<25}" + "".join(f"{n:>{col_w}}" for n in model_names))
-    print("-" * (25 + col_w * len(model_names)))
+        emit(f"  {name}: {got}/{num_labels} classes with F1 > 0")
+    emit("")
+
+    header = f"  {'class':<8}" + "".join(f"{n:>{col_w}}" for n in model_names) + f"  {'best':<16} {'delta':>6}"
+    emit(header)
+    emit("  " + "-" * (len(header) - 2))
+
+    rows = []
     for cls in class_names:
-        row = f"{cls:<25}"
+        f1s = {name: results[name]["per_class"][cls]["f1"] for name in model_names}
+        best_name = max(f1s, key=f1s.get)
+        vals = sorted(f1s.values(), reverse=True)
+        delta = vals[0] - vals[1] if len(vals) > 1 else 0.0
+        rows.append((cls, f1s, best_name, delta))
+
+    rows.sort(key=lambda x: x[3], reverse=True)
+
+    for cls, f1s, best_name, delta in rows:
+        row = f"  {cls:<8}"
         for name in model_names:
-            row += f"{results[name]['per_class'][cls]['f1']:>{col_w}.4f}"
-        print(row)
+            marker = "*" if name == best_name else " "
+            row += f"{f1s[name]:>{col_w - 1}.4f}{marker}"
+        row += f"  {best_name:<16} {delta:>6.4f}"
+        emit(row)
+
+    emit("")
+    if len(model_names) > 1:
+        dominated = sum(1 for _, _, b, _ in rows if b == model_names[0])
+        emit(f"  {model_names[0]} leads on {dominated}/{num_labels} classes")
+        for name in model_names[1:]:
+            cnt = sum(1 for _, _, b, _ in rows if b == name)
+            emit(f"  {name} leads on {cnt}/{num_labels} classes")
+        high_delta = sum(1 for _, _, _, d in rows if d > 0.1)
+        emit(f"  Classes with delta > 0.10 (worth class-routing): {high_delta}/{num_labels}")
 
 
 def export_results(path: str, results: dict, class_names: list, num_labels: int,
                    n_folds: int, run_cfg_lines: list[str]) -> None:
     """Write run config + comparison table + per-class F1 to a text file."""
     model_names = list(results.keys())
-    col_w = 14
 
     lines = [line + "\n" for line in run_cfg_lines]
     lines += [
         "\n",
         f"MODEL COMPARISON ({n_folds}-fold CV, mean ± std)\n",
-        f"{'model':>14} {'accuracy':>16} {'precision':>16} {'recall':>16} {'f1':>16}\n",
-        "-" * 80 + "\n",
+        f"{'model':>14} {'train acc':>14} {'val acc':>14} {'precision':>16} {'recall':>16} {'f1':>16} {'time':>10}\n",
+        "-" * 102 + "\n",
     ]
     for name in model_names:
         m, s = results[name]["mean"], results[name]["std"]
+        tr_acc = results[name].get("train_acc_mean", float("nan"))
+        tr_std = results[name].get("train_acc_std",  0.0)
+        dur = _fmt_duration(results[name].get("total_train_sec", 0))
         lines.append(
-            f"{name:>14} {m['accuracy']:.4f}±{s['accuracy']:.4f}  "
+            f"{name:>14} "
+            f"{tr_acc:.4f}±{tr_std:.4f}  "
+            f"{m['accuracy']:.4f}±{s['accuracy']:.4f}  "
             f"{m['precision']:.4f}±{s['precision']:.4f}  "
             f"{m['recall']:.4f}±{s['recall']:.4f}  "
-            f"{m['f1']:.4f}±{s['f1']:.4f}\n"
+            f"{m['f1']:.4f}±{s['f1']:.4f}  "
+            f"{dur:>8}\n"
         )
 
     best = max(model_names, key=lambda n: results[n]["mean"]["accuracy"])
     lines.append(f"\nBest model: {best} (mean val acc {results[best]['mean']['accuracy'] * 100:.2f}%)\n")
 
-    lines.append(f"\n\nPER-CLASS F1 (mean across {n_folds} folds)\n")
-    for name in model_names:
-        got = sum(1 for cls in class_names if results[name]["per_class"][cls]["f1"] > 0)
-        lines.append(f"  {name}: {got}/{num_labels} classes with F1 > 0\n")
-    lines.append("\n")
-    lines.append(f"{'class':<25}" + "".join(f"{n:>{col_w}}" for n in model_names) + "\n")
-    lines.append("-" * (25 + col_w * len(model_names)) + "\n")
-    for cls in class_names:
-        row = f"{cls:<25}"
-        for name in model_names:
-            row += f"{results[name]['per_class'][cls]['f1']:>{col_w}.4f}"
-        lines.append(row + "\n")
+    _print_per_class_table(results, class_names, num_labels, model_names, n_folds,
+                           lambda s: lines.append(s + "\n"))
 
     with open(path, "w") as f:
         f.writelines(lines)

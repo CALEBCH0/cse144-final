@@ -5,32 +5,53 @@ from torch.utils.data import DataLoader
 from transformers import Trainer, TrainerCallback
 
 
+def signal(event: str, **kwargs):
+    parts = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(f"##SIGNAL## {event} {parts}", flush=True)
+
+
 # ── Freeze / unfreeze ─────────────────────────────────────────────────────────
+
+def _count_transformer_layers(model):
+    """Detect number of encoder blocks by scanning named parameters."""
+    max_idx = -1
+    for name, _ in model.named_parameters():
+        for prefix in ("encoder.layer.", "layers.", "timm_model.blocks."):
+            if prefix in name:
+                try:
+                    idx = int(name.split(prefix)[1].split(".")[0])
+                    max_idx = max(max_idx, idx)
+                except (ValueError, IndexError):
+                    pass
+    return max_idx + 1 if max_idx >= 0 else 12
+
 
 def apply_freeze(model, model_name, unfreeze_blocks):
     """Freeze all params then selectively unfreeze top N blocks/stages + classifier.
 
-    Transformers (dinov2, vit): unfreeze_blocks out of 12 encoder layers from top.
+    Transformers (dinov2, dinov2_large, vit): detects layer count automatically.
     ConvNeXt: unfreeze_blocks out of 4 stages from top.
-    unfreeze_blocks=0 → frozen backbone, head only.
+    unfreeze_blocks=0 -> frozen backbone, head only.
     """
     for param in model.parameters():
         param.requires_grad = False
 
     if unfreeze_blocks > 0:
-        if model_name == "convnext":
+        if "convnext" in model_name:
             for name, param in model.named_parameters():
                 for i in range(4 - unfreeze_blocks, 4):
                     if f"encoder.stages.{i}." in name:
                         param.requires_grad = True
         else:
+            n = _count_transformer_layers(model)
             for name, param in model.named_parameters():
-                for i in range(12 - unfreeze_blocks, 12):
-                    if f"encoder.layer.{i}." in name or f"layers.{i}." in name:
+                for i in range(n - unfreeze_blocks, n):
+                    if (f"encoder.layer.{i}." in name or f"layers.{i}." in name
+                            or f"timm_model.blocks.{i}." in name):
                         param.requires_grad = True
 
     for name, param in model.named_parameters():
-        if "classifier" in name:
+        if "classifier" in name or "timm_model.head" in name:
             param.requires_grad = True
 
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -47,21 +68,25 @@ def get_llrd_optimizer(model, model_name, base_lr, decay_factor, weight_decay):
     """
     groups = []
 
-    if model_name in ("dinov2", "vit"):
+    if model_name in ("dinov2", "dinov2_large", "vit"):
+        n = _count_transformer_layers(model)
         # embeddings — lowest LR
-        emb_params = [p for n, p in model.named_parameters()
-                      if "embeddings" in n and p.requires_grad]
+        emb_params = [p for n_, p in model.named_parameters()
+                      if ("embeddings" in n_ or "patch_embed" in n_
+                          or "cls_token" in n_ or "pos_embed" in n_)
+                      and p.requires_grad]
         if emb_params:
-            groups.append({"params": emb_params, "lr": base_lr * (decay_factor ** 12)})
+            groups.append({"params": emb_params, "lr": base_lr * (decay_factor ** n)})
 
-        # 12 encoder layers: layer 0 (shallowest) → layer 11 (deepest)
-        for i in range(12):
-            layer_params = [p for n, p in model.named_parameters()
-                            if (f"encoder.layer.{i}." in n or f"layers.{i}." in n)
+        # encoder layers: layer 0 (shallowest) -> layer n-1 (deepest)
+        for i in range(n):
+            layer_params = [p for n_, p in model.named_parameters()
+                            if (f"encoder.layer.{i}." in n_ or f"layers.{i}." in n_
+                                or f"timm_model.blocks.{i}." in n_)
                             and p.requires_grad]
             if layer_params:
                 groups.append({"params": layer_params,
-                                "lr": base_lr * (decay_factor ** (11 - i))})
+                                "lr": base_lr * (decay_factor ** (n - 1 - i))})
 
     elif model_name == "convnext":
         emb_params = [p for n, p in model.named_parameters()
@@ -78,7 +103,7 @@ def get_llrd_optimizer(model, model_name, base_lr, decay_factor, weight_decay):
 
     # classifier head always gets the full base_lr
     head_params = [p for n, p in model.named_parameters()
-                   if "classifier" in n and p.requires_grad]
+                   if ("classifier" in n or "timm_model.head" in n) and p.requires_grad]
     if head_params:
         groups.append({"params": head_params, "lr": base_lr})
 
@@ -156,6 +181,45 @@ class CustomTrainer(Trainer):
             loss = F.cross_entropy(logits, labels)
 
         return (loss, outputs) if return_outputs else loss
+
+
+# ── Per-epoch train/val accuracy logging ─────────────────────────────────────
+
+class EpochAccuracyCallback(TrainerCallback):
+    """Prints train and val accuracy at the end of every epoch.
+
+    train_eval_dataset  — training split with val transforms (no augmentation).
+    val_eval_dataset    — validation split with val transforms.
+    collate_fn          — plain collate (no mixup).
+    """
+
+    def __init__(self, train_eval_dataset, val_eval_dataset, collate_fn, batch_size=32):
+        self.train_ds = train_eval_dataset
+        self.val_ds   = val_eval_dataset
+        self.collate  = collate_fn
+        self.batch_size = batch_size
+
+    def _eval_acc(self, model, dataset, device):
+        from torch.utils.data import DataLoader
+        from sklearn.metrics import accuracy_score
+        loader = DataLoader(dataset, batch_size=self.batch_size,
+                            collate_fn=self.collate, shuffle=False)
+        preds, labels = [], []
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                pv = batch["pixel_values"].to(device)
+                out = model(pixel_values=pv)
+                preds.extend(out.logits.argmax(-1).cpu().tolist())
+                labels.extend(batch["labels"].tolist())
+        return accuracy_score(labels, preds)
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        device = next(model.parameters()).device
+        tr_acc  = self._eval_acc(model, self.train_ds, device)
+        val_acc = self._eval_acc(model, self.val_ds,   device)
+        gap = tr_acc - val_acc
+        print(f"\n  [epoch {int(state.epoch):>2}]  train={tr_acc:.4f}  val={val_acc:.4f}  gap={gap:+.4f}")
 
 
 # ── Progressive unfreezing ────────────────────────────────────────────────────
@@ -282,6 +346,37 @@ class MixupCutMixCollator:
         if np.random.random() < self.mixup_prob:
             return self.mixup(examples)
         return self.cutmix(examples)
+
+
+# ── Test-image inference (Kaggle submission) ──────────────────────────────────
+
+def predict_test_images(models, image_paths, val_transform, batch_size=32):
+    """Ensemble-predict test images. Returns numpy array (N,) of class indices.
+
+    models        — list of trained PyTorch models (1 = single model, N = ensemble)
+    image_paths   — paths to test images in submission order
+    val_transform — _Transform object from build_transforms; .tf is the actual callable
+    """
+    from PIL import Image
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensors = [val_transform.tf(Image.open(p).convert("RGB")) for p in image_paths]
+
+    all_logits = []
+    for model in models:
+        model.eval()
+        model.to(device)
+        fold_logits = []
+        for i in range(0, len(tensors), batch_size):
+            batch = torch.stack(tensors[i : i + batch_size]).to(device)
+            with torch.no_grad():
+                out = model(pixel_values=batch)
+            fold_logits.append(out.logits.cpu())
+        all_logits.append(torch.cat(fold_logits, dim=0))
+        model.cpu()
+        torch.cuda.empty_cache()
+
+    return torch.stack(all_logits).mean(0).argmax(dim=1).numpy()
 
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────

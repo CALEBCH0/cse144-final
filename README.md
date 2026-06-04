@@ -1,122 +1,196 @@
-1 Transfer Learning Challenge
-In the previous assignment, you have seen how to train a Simple CNN on the CIFAR-10
-dataset, which does not require sophisticated data preprocessing or model design choices to
-achieve decent accuracy. In this section, your task is to apply transfer learning techniques
-learned in class to train a classifier for a more difficult dataset.
-Please use the URL below to access the Kaggle page of this competition:
-https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project
-The Kaggle page is for evaluation and submission only. Please refer to these instructions
-for details.
-1.1 Dataset
-To save computation, we sample from different datasets, forming a total of 100 classes. For
-each class, there are 10 sampled training images and 10 evaluation images. All images in
-the training and evaluation sets are colored, but they may have different shapes. Thus, it is
-strongly advised to resize all images to the same size (e.g., 224 × 224) before training.
-The dataset directory is structured as follows:
-train/
-- 0/
-- 0.jpg
-- 1.jpg
-...
-- 9.jpg
-1
-- 1/
-...
-- 99/
-...
-test/
-- 0.jpg
-- 1.jpg
-...
-- 999.jpg
-- sample_submission.csv
-In the train/ directory, there are 100 directories, each named by a string label. Each di-
-rectory contains approximately 10 images of a particular class. The test/ directory contains
-1000 unlabeled images.
-You may only use the images in the train/ directory for training. After finishing hy-
-perparameter tuning, you will load all test images and predict their labels using your final
-model.
-You must submit a submission.csv file with two columns: {ID, Label}. A sample file
-sample submission.csv is provided as a template.
-You should leave the ID column unchanged and fill in the Label column with your pre-
-dictions.
-The training samples are already grouped by categories. Note that different implemen-
-tations might lead to different category orders. For example, class “0” may be mapped to
-class 1. To ensure correct evaluation, you must use:
 • Label 0 for class “0”
 • Label 1 for class “1”
 • And so on
-If the label order is scrambled, the best possible result will be no better than random
-guessing.
-1.2 Implementation and Training
-We strongly suggest reusing code from the previous assignment. You may modify the existing
-code by adopting:
-2
 • More advanced architectures
 • More sophisticated data augmentations
 • Tuned hyperparameters
-Unlike previous assignments, you are required to load strong pre-trained model weights
-and fine-tune them on this dataset. This enables fast convergence and decent accuracy with
-limited data and computation.
-See TorchVision models for available pretrained weights.
-Advice: Modern models are often several orders of magnitude larger than models used
-previously. These introduce significant computational overhead.
-Before using large models, try training on a small subset of the data to check:
 • Whether the model fits in GPU memory
 • How long training takes
-Since the dataset contains only 1000 samples, very large models may overfit.
-1.3 Reproducibility
-Please ensure that your final training and testing accuracies are reproducible. With your
-submitted code and documents, others should be able to reproduce your results with similar
-means and standard deviations.
-Good reproducibility practices include:
 • Using a fixed random seed
 • Reporting averaged metrics overall multiple runs
 • Providing detailed execution instructions
-If your final accuracy cannot be reproduced using your submitted code, your competition
-score may be affected.
-3
-1.4 Submission
-As described in Section 1.1, you must submit a CSV file with image IDs and predicted labels
-on Kaggle.
-The public leaderboard provides an estimated score based on approximately 10% of the
-final test set. Do not use it to infer final performance.
-Use the public leaderboard only to verify submission format.
-Additionally, you must submit a public Github repository link to Canvas:
-1. The public GitHub repository must include all source code, a project report in PDF
-format, and a Google drive link to the trained model weights.
-2. The repository README should clearly document how to run both training and in-
-ference using the provided model.
-3. It must also include a screenshot showing your team’s position on the Kaggle leader-
-board, with the screenshot referenced directly in the README.
-4. The report with instructions, experimental setup, etc. Please refer to the “sample
-report”.
-1.5 Grading Criteria
-The project score is divided into three parts (maximum total score: 100).
-1. Kaggle test set accuracy. You need to pass the baseline test accuracy of 60%. Let x
-be your submission accuracy (in %). Define the Kaggle score:
-Skaggle =
 
 
 
 0, if no submission,
 70 + max(0, x − 60), otherwise,
-where the bonus term max(0, x − 60) has no upper limit.
-2. Presentation. Let p ∈ [0, 10] be the score of the presentation.
-Spres =
 
 
 
 p, if there’s a presentation,
 −10, if no presentation.
-4
-3. Report + code + model weights. Let r ∈ [0, 10] be the graded score based on the
-provided report and uploaded code/model weights.
-Srepo =
 
 
 
 r, if report+code+weights are submitted,
 −10, otherwise.
-The total project score is Stotal = min100, Skaggle + Spres + Srepo
 .
+ # CSE 144 Final Project
+
+ Transfer learning pipeline for the UCSC CSE 144 Spring 2026 final image classification challenge.
+
+ Competition page: <https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project>
+
+ ## Overview
+
+ This repository contains experiments for a 100-class image classification task built from a small sampled dataset. The project focuses on transfer learning with pretrained vision backbones and compares several families of models, including:
+
+ - DINOv2
+ - ConvNeXt
+ - ViT
+ - ResNet baselines
+
+ The codebase includes:
+
+ - A cross-validation training pipeline
+ - A hyperparameter search script
+ - Model definitions and preprocessing utilities
+ - Saved checkpoints for multiple model families
+ - A project report with experiment notes and results
+
+ ## Dataset
+
+ The competition dataset is expected under `data/`.
+
+ ```text
+ data/
+	 train/
+		 0/
+		 1/
+		 ...
+		 99/
+	 test/
+	 sample_submission.csv
+ ```
+
+ Important label convention:
+
+ - Folder `0` must map to label `0`
+ - Folder `1` must map to label `1`
+ - ...
+ - Folder `99` must map to label `99`
+
+ The current pipeline loads the training split from `data/train` and performs stratified cross-validation.
+
+ ## Environment Setup
+
+ Install dependencies:
+
+ ```bash
+ pip install -r requirements.txt
+ ```
+
+ Main packages used:
+
+ - PyTorch
+ - TorchVision
+ - Transformers
+ - Datasets
+ - timm
+ - peft
+ - scikit-learn
+
+ ## Repository Layout
+
+ ```text
+ config.py        Default training/search configuration
+ pipeline.py      Main training and cross-validation entry point
+ search.py        Hyperparameter search runner
+ resulter.py      Result formatting/export helpers
+ transforms.py    Image preprocessing and augmentation setup
+ utils.py         Training utilities, TTA, ensemble helpers, LoRA helpers
+ models/          Model factory implementations
+ checkpoints/     Saved checkpoints for trained models
+ report.md        Project report draft and experiment summary
+ docs/            Background notes on models and prior methods
+ ```
+
+ ## Running Experiments
+
+ ### 1. Configure the run
+
+ Edit `config.py` to choose:
+
+ - `SELECTED_MODELS`
+ - `NUM_EPOCHS`
+ - `BATCH_SIZE`
+ - `UNFREEZE_BLOCKS`
+ - augmentation toggles such as `USE_MIXUP` and `USE_RANDAUGMENT`
+ - advanced options such as TTA, ensemble prediction, progressive unfreezing, and LoRA
+
+ Current defaults are tuned toward the best search findings in this repository.
+
+ ### 2. Run cross-validation training
+
+ ```bash
+ python pipeline.py
+ ```
+
+ To also export a text summary:
+
+ ```bash
+ python pipeline.py --export results.txt
+ ```
+
+ What `pipeline.py` does:
+
+ - Loads `data/train` with the Hugging Face `imagefolder` loader
+ - Runs stratified `N_FOLDS` cross-validation
+ - Fine-tunes the selected pretrained models
+ - Reports accuracy, precision, recall, and macro F1
+ - Optionally applies TTA and fold ensembling
+
+ ### 3. Run hyperparameter search
+
+ ```bash
+ python search.py
+ ```
+
+ The search script:
+
+ - Evaluates predefined experiment configs
+ - Uses resume-friendly logging in `search_results.csv`
+ - Skips completed configs already written to the CSV
+ - Reports mean and standard deviation across folds
+
+ ## Current Configuration Notes
+
+ The default config in `config.py` currently enables:
+
+ - Mixup
+ - Progressive unfreezing
+ - Test-time augmentation
+ - Fold ensembling
+ - RandAugment
+
+ The default config currently disables:
+
+ - LLRD, because search results showed little benefit
+ - Color jitter, because it hurt ConvNeXt performance in this dataset
+ - Random erasing, pending stronger evidence from search
+ - LoRA, unless explicitly selected for DINOv2 or ViT experiments
+
+ ## Results Summary
+
+ Highlights from `report.md` and `search_results.csv`:
+
+ - ConvNeXt-Base and ViT-B/16 reached about 70.7% mean validation accuracy in 5-fold CV
+ - ConvNeXt-Large improved that to 77.85% mean validation accuracy in the stronger multi-technique setup
+ - The best search result in the repository is DINOv2 with `unfreeze_blocks=2`, reaching 84.24% mean CV accuracy
+
+ These results suggest that selective partial unfreezing is more effective than full fine-tuning on this small dataset.
+
+ ## Notes on Submission
+
+ The assignment requires a Kaggle submission file with columns:
+
+ - `ID`
+ - `Label`
+
+ This repository currently focuses on training, evaluation, checkpointing, and search. If you need a dedicated inference script for generating `submission.csv` from `data/test`, that should be added as a separate step.
+
+ ## References
+
+ - Competition page: <https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project>
+ - Report draft: `report.md`
+ - Model and SOTA notes: `docs/`

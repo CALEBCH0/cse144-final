@@ -25,6 +25,7 @@ from config import (
     TRAIN_DIR,
     TTA_AUGMENTS,
     UNFREEZE_BLOCKS,
+    USE_CLASS_ROUTING,
     USE_COLOR_JITTER,
     USE_CUTMIX,
     USE_ENSEMBLE,
@@ -37,7 +38,7 @@ from config import (
     USE_TTA,
 )
 from models import MODELS
-from resulter import build_run_config_lines, export_results, print_results
+from resulter import build_run_config_lines, export_per_class_csv, export_results, print_results
 from transforms import build_transforms
 from utils import (
     CustomTrainer,
@@ -49,10 +50,17 @@ from utils import (
     apply_freeze,
     apply_lora,
     ensemble_predict,
+    get_test_probs,
     predict_test_images,
     predict_with_tta,
     signal,
 )
+
+
+def _softmax_np(x):
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=1, keepdims=True)
 
 
 def collate_fn(examples):
@@ -104,6 +112,22 @@ def main():
     results = {}
     selected = [cfg for cfg in MODELS if cfg["name"] in SELECTED_MODELS]
 
+    # Pre-compute test paths once (shared across all models)
+    data_root = os.path.dirname(TRAIN_DIR)
+    test_dir = os.path.join(data_root, "test")
+    test_ids, image_paths = [], []
+    if os.path.isdir(test_dir):
+        test_ids = sorted(
+            [f for f in os.listdir(test_dir) if f.lower().endswith(".jpg")],
+            key=lambda x: int(x.split(".")[0]),
+        )
+        image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
+
+    # For class-routing: track fold models and val probs keyed by model name
+    all_fold_models_by_name = {}   # name -> list[fold models on CPU]
+    all_val_probs_by_fold = {}     # name -> list[(val_idx, probs (N, C))]
+    all_val_tf_by_name = {}        # name -> val_transform
+
     for model_cfg in selected:
         name = model_cfg["name"]
         print(f"\n{'='*60}")
@@ -146,13 +170,17 @@ def main():
 
             model = model_cfg["get_model"](num_labels, label2id, id2label)
 
+            model_unfreeze = model_cfg.get("unfreeze_blocks", UNFREEZE_BLOCKS)
+            model_epochs   = model_cfg.get("num_epochs", NUM_EPOCHS)
+            model_llrd     = model_cfg.get("llrd_factor", LLRD_FACTOR)
+
             if USE_LORA:
                 model = apply_lora(model, name, r=LORA_R)
                 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 print(f"  LoRA r={LORA_R} — {trainable:,} trainable params")
             else:
-                trainable = apply_freeze(model, name, UNFREEZE_BLOCKS)
-                print(f"  Frozen backbone — {trainable:,} trainable params (unfreeze_blocks={UNFREEZE_BLOCKS})")
+                trainable = apply_freeze(model, name, model_unfreeze)
+                print(f"  Frozen backbone — {trainable:,} trainable params (unfreeze_blocks={model_unfreeze})")
 
             train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
 
@@ -165,7 +193,7 @@ def main():
                 output_dir=os.path.join(model_cfg["output_dir"], f"fold_{fold_idx}"),
                 do_train=True,
                 do_eval=True,
-                num_train_epochs=NUM_EPOCHS,
+                num_train_epochs=model_epochs,
                 per_device_train_batch_size=BATCH_SIZE,
                 per_device_eval_batch_size=BATCH_SIZE,
                 learning_rate=model_cfg.get("learning_rate", LEARNING_RATE),
@@ -191,7 +219,7 @@ def main():
                 processing_class=image_processor,
                 data_collator=data_collator,
                 callbacks=callbacks,
-                llrd_factor=LLRD_FACTOR if (USE_LLRD and not USE_LORA) else 1.0,
+                llrd_factor=model_llrd if (USE_LLRD and not USE_LORA) else 1.0,
                 model_name=name,
                 use_mixup=USE_MIXUP or USE_CUTMIX,
             )
@@ -207,6 +235,11 @@ def main():
 
             preds = np.argmax(preds_out.predictions, axis=1)
             true = preds_out.label_ids
+
+            if USE_CLASS_ROUTING:
+                all_val_probs_by_fold.setdefault(name, []).append(
+                    (val_idx, _softmax_np(preds_out.predictions))
+                )
 
             fold_metrics.append({
                 "accuracy": accuracy_score(true, preds),
@@ -243,7 +276,7 @@ def main():
                 tta_f1 = f1_score(true, tta_preds, average="macro", zero_division=0)
                 print(f"  Fold {fold_idx + 1} TTA:  acc={tta_acc:.4f}  f1={tta_f1:.4f}  (delta acc {tta_acc - fold_metrics[-1]['accuracy']:+.4f})")
 
-            if USE_ENSEMBLE:
+            if USE_ENSEMBLE or USE_CLASS_ROUTING:
                 fold_models.append(model)
 
         mean = {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
@@ -273,6 +306,10 @@ def main():
             "total_train_sec": total_train,
             "total_eval_sec": total_eval,
         }
+        if USE_CLASS_ROUTING:
+            all_fold_models_by_name[name] = fold_models[:]
+            all_val_tf_by_name[name] = val_tf
+
         signal("model_done", model=name, acc=round(mean["accuracy"], 4),
                f1=round(mean["f1"], 4), total_min=round(total_train / 60, 1))
         print(f"\n{name} CV results ({N_FOLDS} folds):")
@@ -294,17 +331,8 @@ def main():
 
         # ── Kaggle test inference ──────────────────────────────────────────────
         submission_models = fold_models if fold_models else [model]
-        data_root = os.path.dirname(TRAIN_DIR)
-        test_dir = os.path.join(data_root, "test")
 
-        if os.path.isdir(test_dir):
-            # Use all jpg files — Kaggle expects every image in the test dir (1036, not just 1000)
-            test_ids = sorted(
-                [f for f in os.listdir(test_dir) if f.lower().endswith(".jpg")],
-                key=lambda x: int(x.split(".")[0]),
-            )
-
-            image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
+        if image_paths:
             submission_path = f"submission_{name}.csv"
             print(f"\n  Predicting {len(test_ids)} test images ({len(submission_models)} fold model(s))...")
             test_preds = predict_test_images(submission_models, image_paths, val_tf)
@@ -333,6 +361,85 @@ def main():
                     print(f"  {result.stdout.strip()}")
                 else:
                     print(f"  Kaggle submission failed: {result.stderr.strip()}")
+
+    # ── Class-routed ensemble ──────────────────────────────────────────────────
+    if USE_CLASS_ROUTING and len(results) > 1:
+        model_names_only = list(results.keys())
+        print(f"\n{'='*60}")
+        print(f"Class-routed ensemble ({len(model_names_only)} models)")
+        print(f"{'='*60}")
+
+        # Per-class F1 weights: (C,) per model
+        weights_by_name = {
+            name: np.array([results[name]["per_class"][cls]["f1"] for cls in class_names], dtype=np.float32)
+            for name in model_names_only
+        }
+
+        # Validate on each fold using stored val probs
+        ens_fold_metrics = []
+        ens_fold_per_class_f1 = []
+        ens_fold_per_class_precision = []
+        ens_fold_per_class_recall = []
+
+        for fold_idx, (_, val_idx) in enumerate(fold_splits):
+            routed = np.zeros((len(val_idx), num_labels), dtype=np.float32)
+            for name in model_names_only:
+                _, probs = all_val_probs_by_fold[name][fold_idx]
+                routed += probs * weights_by_name[name]
+
+            preds = routed.argmax(axis=1)
+            true = np.array(full_dataset.select(val_idx)["label"])
+
+            ens_fold_metrics.append({
+                "accuracy":  accuracy_score(true, preds),
+                "precision": precision_score(true, preds, average="macro", zero_division=0),
+                "recall":    recall_score(true, preds, average="macro", zero_division=0),
+                "f1":        f1_score(true, preds, average="macro", zero_division=0),
+            })
+            ens_fold_per_class_f1.append(
+                f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+            ens_fold_per_class_precision.append(
+                precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+            ens_fold_per_class_recall.append(
+                recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+
+        ens_mean = {m: float(np.mean([f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
+        ens_std  = {m: float(np.std( [f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
+
+        results["routed_ensemble"] = {
+            "folds":           ens_fold_metrics,
+            "mean":            ens_mean,
+            "std":             ens_std,
+            "train_acc_mean":  float("nan"),
+            "train_acc_std":   0.0,
+            "per_class": {
+                class_names[i]: {
+                    "f1":        float(np.mean(ens_fold_per_class_f1, axis=0)[i]),
+                    "precision": float(np.mean(ens_fold_per_class_precision, axis=0)[i]),
+                    "recall":    float(np.mean(ens_fold_per_class_recall, axis=0)[i]),
+                }
+                for i in range(num_labels)
+            },
+            "total_train_sec": 0.0,
+            "total_eval_sec":  0.0,
+        }
+        print(f"  acc={ens_mean['accuracy']:.4f}+/-{ens_std['accuracy']:.4f}"
+              f"  f1={ens_mean['f1']:.4f}+/-{ens_std['f1']:.4f}")
+
+        # Test inference: generate submission_routed.csv
+        if image_paths:
+            all_weighted_probs = []
+            for name in model_names_only:
+                probs = get_test_probs(all_fold_models_by_name[name], image_paths, all_val_tf_by_name[name])
+                all_weighted_probs.append(probs * weights_by_name[name])
+            routed_test = sum(all_weighted_probs).argmax(axis=1)
+            routed_path = "submission_routed.csv"
+            with open(routed_path, "w", newline="") as sf:
+                writer = csv.writer(sf)
+                writer.writerow(["ID", "Label"])
+                for img_id, pred in zip(test_ids, routed_test):
+                    writer.writerow([img_id, int(class_names[int(pred)])])
+            print(f"  Routed submission saved: {routed_path}")
 
     run_cfg = {
         "selected_models": SELECTED_MODELS,
@@ -366,6 +473,12 @@ def main():
 
     if args.export:
         export_results(args.export, results, class_names, num_labels, N_FOLDS, run_cfg_lines)
+        if len(results) > 1:
+            base, ext = os.path.splitext(args.export)
+            export_per_class_csv(
+                base + ".per_class.csv",
+                results, class_names, list(results.keys()),
+            )
 
 
 if __name__ == "__main__":

@@ -379,6 +379,31 @@ def predict_test_images(models, image_paths, val_transform, batch_size=32):
     return torch.stack(all_logits).mean(0).argmax(dim=1).numpy()
 
 
+def get_test_probs(models, image_paths, val_transform, batch_size=32):
+    """Like predict_test_images but returns averaged softmax probs (N, C) for class-routed ensemble."""
+    from PIL import Image
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensors = [val_transform.tf(Image.open(p).convert("RGB")) for p in image_paths]
+
+    all_logits = []
+    for model in models:
+        model.eval()
+        model.to(device)
+        fold_logits = []
+        for i in range(0, len(tensors), batch_size):
+            batch = torch.stack(tensors[i : i + batch_size]).to(device)
+            with torch.no_grad():
+                out = model(pixel_values=batch)
+            fold_logits.append(out.logits.cpu())
+        all_logits.append(torch.cat(fold_logits, dim=0))
+        model.cpu()
+        torch.cuda.empty_cache()
+
+    mean_logits = torch.stack(all_logits).mean(0)
+    return torch.softmax(mean_logits, dim=-1).numpy()
+
+
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 
 # Target modules verified by inspecting named_modules() of each loaded model:

@@ -16,6 +16,7 @@ from transforms import build_transforms
 from utils import (
     CutMixCollator,
     CustomTrainer,
+    EpochAccuracyCallback,
     MixupCollator,
     MixupCutMixCollator,
     apply_freeze as _apply_freeze,
@@ -45,7 +46,11 @@ CONFIGS_TO_RUN = {
     # DINOv2-base: best lr + best LLRD combos, more unfreeze, longer training
     # 64, 65, 66, 67, 68, 69,
     # DINOv2-Large + DINOv2-base: combine best findings, overnight run
-    70, 71, 72, 73, 74, 75, 76, 77,
+    # 70, 71, 72, 73, 74, 75, 76, 77,
+    # More epochs + LLRD sweep + cosine + deeper unfreeze for Large; base cosine
+    # 78, 79, 80, 81, 82, 83, 84,  # done / currently running
+    # 518px resolution + RandAugment combos
+    85, 86, 87,
 }
 
 # fmt: off
@@ -219,6 +224,41 @@ SEARCH_CONFIGS = [
     # H: base best config + 30ep
     {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
      "llrd_factor": 0.85, "num_epochs": 30},
+
+    # ── Next search: more epochs + LLRD sweep + cosine + deeper unfreeze ──  idx 78-84
+    # 78: continue LLRD sweep — 0.85→0.75 gained +0.19%; does 0.65 continue the trend?
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.65, "num_epochs": 30},
+    # 79: 40ep — Large still improving at 30ep (+1.2% over 20ep); expect +0.3-0.5% more
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 40},
+    # 80: 50ep — queue alongside 40ep to avoid wasting a night if 40ep still gains
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50},
+    # 81: cosine at 30ep — long training commonly benefits from cosine LR decay
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30},
+    # 82: unfreeze=4 for Large — 4/24 layers is only 17% (vs 33% for base); safe with LLRD=0.65
+    {"model": "dinov2_large", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.65, "num_epochs": 30},
+    # 83: push LR higher — needs even gentler LLRD to protect lower layers
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 2e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.65, "num_epochs": 30},
+    # 84: base cosine — only untested axis for DINOv2-base
+    {"model": "dinov2", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.85, "num_epochs": 10},
+
+    # ── 518px resolution + RandAugment combos ─────────────────────────  idx 85-87
+    # 85: dinov2_large at native 518px (patch_size=14 → 37×37 patches vs 16×16 at 224px)
+    #     batch_size=16 to stay within VRAM (5× more tokens → higher activation memory)
+    {"model": "dinov2_large_518", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30, "batch_size": 16},
+    # 86: RandAugment on 224px Large — +0.93% on base but never tested on Large; isolate aug effect
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30, "use_randaugment": True},
+    # 87: 518px + RandAugment — combined; only run after 85/86 confirm both are individually positive
+    {"model": "dinov2_large_518", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30, "use_randaugment": True, "batch_size": 16},
 ]
 # fmt: on
 
@@ -266,11 +306,12 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         else:
             trainable = _apply_freeze(model, cfg["model"], cfg["unfreeze_blocks"])
 
+        fold_batch_size = cfg.get("batch_size", BATCH_SIZE)
         training_args = TrainingArguments(
             output_dir=os.path.join(model_cfg["output_dir"], "search", f"fold_{fold_idx}"),
             num_train_epochs=cfg.get("num_epochs", NUM_EPOCHS),
-            per_device_train_batch_size=BATCH_SIZE,
-            per_device_eval_batch_size=BATCH_SIZE,
+            per_device_train_batch_size=fold_batch_size,
+            per_device_eval_batch_size=fold_batch_size,
             learning_rate=cfg["lr"],
             weight_decay=cfg["weight_decay"],
             label_smoothing_factor=cfg["label_smoothing"],
@@ -302,6 +343,9 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
             model_name=cfg["model"],
             use_mixup=use_soft_labels,
         )
+
+        train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
+        trainer.add_callback(EpochAccuracyCallback(train_eval_fold, val_fold, collate_fn))
 
         try:
             t0 = time.perf_counter()

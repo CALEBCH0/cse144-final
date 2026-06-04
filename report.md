@@ -348,6 +348,7 @@ Combining the best LR (1e-4) with the best LLRD factor (0.85) and probing deeper
 
 #### 5.5.16 DINOv2-Large overnight — best configs (configs 70–77)
 
+
 Combining all best findings (lr=1e-4, 30ep, LLRD, selective augmentation) for Large:
 
 | config | lr | LLRD | epochs | aug | acc |
@@ -370,6 +371,26 @@ Key takeaways:
 - **DINOv2-base with 20/30ep regresses:** 76 (20ep) → 0.8499, 77 (30ep) → 0.8406 vs best base 10ep → 0.8554. Base overfits past 10 epochs; Large does not.
 - **lr=5e-5 vs 1e-4 for Large:** at 30ep, 5e-5 + LLRD=0.85 → 0.8563, 1e-4 + LLRD=0.75 → 0.8684. Higher LR requires LLRD to protect earlier layers but yields +1.2 points.
 
+#### 5.5.17 LLRD lower bound for DINOv2-Large (config 78)
+
+| config | LLRD | epochs | acc | delta vs best (0.8684) |
+|---|---|---|---|---|
+| 72 | 0.75 | 30 | 0.8684 | — (best) |
+| 70 | 0.85 | 30 | 0.8665 | −0.19% |
+| **78** | **0.65** | **30** | **0.8610** | **−0.74%** |
+
+LLRD=0.65 hurts — aggressively cutting the LR on lower layers starves the upper-layer gradients. The optimal range is 0.75–0.85; 0.75 is the sweet spot for Large at lr=1e-4.
+
+#### 5.5.18 Extended epochs — 40ep and 50ep for DINOv2-Large (configs 79–80)
+
+| config | epochs | acc | delta vs 30ep best |
+|---|---|---|---|
+| 72 | 30 | 0.8684 | — (best) |
+| 79 | 40 | 0.8647 | −0.37% |
+| 80 | 50 | _in progress_ | — |
+
+40 epochs does **not** improve over 30ep — in fact it slightly regresses (−0.37%). Despite fold 1 reaching 89.8% (vs 88.8% at 30ep), the mean drops once the harder folds are included. DINOv2-Large's optimal training window is 30 epochs; extending to 40ep suggests mild overfitting begins. Config 80 (50ep) is running to confirm the trend.
+
 ### 5.6 Overall Best Results Summary
 
 | Model | Best acc | Config | Key settings |
@@ -381,6 +402,34 @@ Key takeaways:
 | ViT-B/16 | 74.42% | 54 | unfreeze=4, LLRD=0.85, +CJ |
 | DINOv2-Base | 85.54% | 64 | unfreeze=2, lr=1e-4, LLRD=0.85, 10ep |
 | **DINOv2-Large** | **86.84%** | **72** | **unfreeze=2, lr=1e-4, LLRD=0.75, 30ep** |
+
+### 5.7 Pipeline Run — Class-Routed Ensemble (DINOv2-Base + DINOv2-Large)
+
+Full 5-fold CV pipeline run with both DINOv2 models using their per-model best configs, followed by a class-routed weighted ensemble. Each model's submission CSV and the combined routed ensemble CSV were generated.
+
+**Per-model best configs used:**
+- DINOv2-Base: lr=1e-4, LLRD=0.85, unfreeze=2, 10 epochs (config 64 settings)
+- DINOv2-Large: lr=1e-4, LLRD=0.75, unfreeze=2, 30 epochs (config 72 settings)
+
+**5-fold CV results:**
+
+| Model | Val Acc | F1 | Train Time |
+|---|---|---|---|
+| DINOv2-Base | 0.8434 ± — | 0.826 | 11.2 min |
+| DINOv2-Large | 0.8647 ± — | 0.847 | 55.2 min |
+| **Routed Ensemble** | **0.8684** | — | — |
+
+**Class-routing analysis (51+34+15 = 100 classes):**
+- DINOv2-Base leads on **51/100** classes
+- DINOv2-Large leads on **34/100** classes
+- Routed ensemble leads on **15/100** classes (outperforms both individuals)
+
+The routed ensemble (+0.37% over Large alone) confirms that Base and Large are complementary: despite Large's higher overall accuracy, Base dominates more than half the classes individually. Class routing successfully leverages this complementarity.
+
+**Submission files generated:**
+- `submission_dinov2.csv` — DINOv2-Base single-model predictions
+- `submission_dinov2_large.csv` — DINOv2-Large single-model predictions
+- `submission_routed.csv` — Class-routed ensemble (best submission)
 
 2. **Kaggle public leaderboard score.** _TODO_
 3. **Qualitative error analysis.** _TODO_
@@ -394,8 +443,9 @@ Key takeaways:
 2. **Failure cases, overfitting/underfitting observations.** Class 66 scores F1=0 across all models — consistently the hardest class. DINOv2-base overfits past 10 epochs: 20ep → 0.8526 < 0.8554, 30ep → 0.8406 (using best config 64 params). DINOv2-Large does not show this: 30ep → 0.8684 > 20ep → 0.8564. ViT-B/16's steep LR sensitivity (2% frozen at 1e-5, 45% at 1e-4) reflects the CLS token struggling to adapt without backbone gradient flow; partial unfreezing with LLRD resolves it (+27 pts). The layer-count bug in `apply_freeze` (hardcoded 12 layers) made configs 57–58 invalid — DINOv2-Large has 24 layers, so unfreeze=2 was actually unfreezing layers 10–11 instead of 22–23.
 
 3. **Limitations and next steps.**
-   - **DINOv2-Large with TTA and ensemble not yet run:** The 86.84% search result uses no TTA or 5-fold ensemble averaging. Running `pipeline.py` with the config 72 settings and TTA is the immediate next step and likely adds 0.5–1 point.
-   - **Per-class ensemble potential:** The resulter.py per-class F1 delta table enables class-routing — routing each test image to the model that historically dominates that class rather than averaging all models. Worth evaluating if Large and Base are complementary on specific classes.
+   - **Class-routed ensemble implemented and evaluated:** Running both DINOv2-Base and DINOv2-Large through the full pipeline with class-routing yields 86.84% — a +0.37% gain over Large alone. Base dominates 51/100 classes despite lower overall accuracy, confirming complementarity. `submission_routed.csv` is the current best submission.
+   - **518px native resolution untested:** DINOv2 was pretrained at 518px (patch_size=14 → 37×37 patches). The pipeline currently downsamples to 224px (16×16 patches), discarding spatial detail. Config 85 (518px, batch=16) is queued to measure the impact.
+   - **RandAugment on DINOv2-Large untested:** Config 86 (RandAugment, 224px) will isolate the augmentation effect on Large specifically.
    - **Label-mixing collators ineffective at this scale:** Mixup (−2%), CutMix (−6%), MixupCutMix (−6%) all hurt at ~10 images/class. Disabled in the final pipeline.
    - **Augmentation is neutral-to-harmful for DINOv2:** RandAugment and the full aug stack consistently degrade both Base and Large. Only ViT benefits from ColorJitter.
    - **Small dataset ceiling:** With ~10 images per class, further gains likely require semi-supervised pseudo-labeling on the test set or external data augmentation from similar public datasets.

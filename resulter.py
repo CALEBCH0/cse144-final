@@ -100,7 +100,6 @@ def print_results(results: dict, class_names: list, num_labels: int,
     print(f"\nBest model: {best} (mean val acc {results[best]['mean']['accuracy'] * 100:.2f}%)")
 
     # ── per-class F1 table ─────────────────────────────────────────────
-    col_w = 10
     _print_per_class_table(results, class_names, num_labels, model_names, n_folds, print)
 
 
@@ -109,7 +108,7 @@ def _print_per_class_table(results, class_names, num_labels, model_names, n_fold
 
     emit — callable that accepts a string (print or file.write line).
     """
-    col_w = 10
+    col_w = max(10, max(len(n) for n in model_names) + 1)
     emit(f"\n{'='*_W}")
     emit(f"PER-CLASS F1 (mean across {n_folds} folds) — sorted by model spread (delta)")
     emit(f"{'='*_W}")
@@ -187,3 +186,37 @@ def export_results(path: str, results: dict, class_names: list, num_labels: int,
     with open(path, "w") as f:
         f.writelines(lines)
     print(f"\nResults saved to {path}")
+
+
+def export_per_class_csv(path: str, results: dict, class_names: list, model_names: list) -> None:
+    """Write per-class F1/precision/recall comparison to CSV, sorted by inter-model delta."""
+    import csv
+
+    rows = []
+    for cls in class_names:
+        f1s = {name: results[name]["per_class"][cls]["f1"] for name in model_names}
+        best_name = max(f1s, key=f1s.get)
+        vals = sorted(f1s.values(), reverse=True)
+        delta = vals[0] - vals[1] if len(vals) > 1 else 0.0
+        row = {"class": cls}
+        for name in model_names:
+            row[f"{name}_f1"]        = f"{results[name]['per_class'][cls]['f1']:.4f}"
+            row[f"{name}_precision"] = f"{results[name]['per_class'][cls]['precision']:.4f}"
+            row[f"{name}_recall"]    = f"{results[name]['per_class'][cls]['recall']:.4f}"
+        row["best_model"] = best_name
+        row["delta"] = f"{delta:.4f}"
+        rows.append((delta, row))
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+
+    fieldnames = ["class"]
+    for name in model_names:
+        fieldnames += [f"{name}_f1", f"{name}_precision", f"{name}_recall"]
+    fieldnames += ["best_model", "delta"]
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for _, row in rows:
+            writer.writerow(row)
+    print(f"Per-class CSV saved to {path}")

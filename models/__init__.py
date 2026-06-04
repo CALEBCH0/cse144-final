@@ -10,6 +10,9 @@ from models.dinov2 import get_processor as get_dinov2_processor
 from models.dinov2_large import MODEL_ID as DINOV2_LARGE_MODEL_ID
 from models.dinov2_large import get_model as get_dinov2_large
 from models.dinov2_large import get_processor as get_dinov2_large_processor
+from models.dinov2_large_518 import MODEL_ID as DINOV2_LARGE_518_MODEL_ID
+from models.dinov2_large_518 import get_model as get_dinov2_large_518
+from models.dinov2_large_518 import get_processor as get_dinov2_large_518_processor
 from models.convnext_large import MODEL_ID as CONVNEXT_LARGE_MODEL_ID
 from models.convnext_large import get_model as get_convnext_large
 from models.convnext_large import get_processor as get_convnext_large_processor
@@ -30,7 +33,10 @@ MODELS = [
         "get_model": get_dinov2,
         "get_processor": get_dinov2_processor,
         "output_dir": "checkpoints/dinov2",
-        "freeze_backbone": True,
+        "learning_rate": 1e-4,   # cfg 64: best base config (85.54%)
+        "llrd_factor": 0.85,
+        "num_epochs": 10,        # base peaks at 10ep; 20ep regresses
+        "unfreeze_blocks": 2,
     },
     {
         "name": "dinov2_large",
@@ -38,6 +44,21 @@ MODELS = [
         "get_model": get_dinov2_large,
         "get_processor": get_dinov2_large_processor,
         "output_dir": "checkpoints/dinov2_large",
+        "learning_rate": 1e-4,   # cfg 72: best large config (86.84%)
+        "llrd_factor": 0.75,
+        "num_epochs": 30,        # large benefits from 30ep without overfitting
+        "unfreeze_blocks": 2,
+    },
+    {
+        "name": "dinov2_large_518",
+        "model_id": DINOV2_LARGE_518_MODEL_ID,
+        "get_model": get_dinov2_large_518,
+        "get_processor": get_dinov2_large_518_processor,
+        "output_dir": "checkpoints/dinov2_large_518",
+        "learning_rate": 1e-4,
+        "llrd_factor": 0.75,
+        "num_epochs": 30,
+        "unfreeze_blocks": 2,
     },
     {
         "name": "convnext_tiny",

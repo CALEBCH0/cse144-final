@@ -1,5 +1,6 @@
 SELECTED_MODELS = [
     "dinov2",
+    "dinov2_large",
 ]
 
 GPU_MEMORY_FRACTION = 0.85
@@ -22,13 +23,14 @@ N_FOLDS = 5
 USE_MIXUP = False              # Search (cfg 35): Mixup hurts ConvNeXt −1.95%; disabled
 USE_CUTMIX = False             # Search (cfg 36/37): CutMix/MixupCutMix hurt −6%; disabled
 USE_PROGRESSIVE_UNFREEZE = False # DINOv2: fixed unfreeze=2 is optimal; prog-unfreeze does full FT at ep3 which hurts
-USE_LLRD = False               # LLRD showed no benefit in search; disabled
+USE_LLRD = True                # Both DINOv2 models benefit: base=0.85, large=0.75 (per-model override in MODELS)
 USE_TTA = True                 # Test-time augmentation (5 passes)
 USE_ENSEMBLE = True            # Average logits from all fold models
 USE_COLOR_JITTER = False       # Hurts ConvNeXt (−1.76%); disabled
 USE_RANDAUGMENT = False        # Best DINOv2 config (84.24%) used no augmentation
 USE_RANDOM_ERASING = False     # Marginal in full stack; disabled until more data
 USE_LORA = False               # LoRA adapters (dinov2 / vit only); overrides freeze strategy
+USE_CLASS_ROUTING = True       # Class-routed weighted ensemble using per-class val F1 as weights
 LORA_R = 8                     # LoRA rank (4/8/16)
 LLRD_FACTOR = 0.75
 PROGRESSIVE_UNFREEZE_EPOCH = 3

@@ -77,3 +77,10 @@ config,model,unfreeze_blocks,lr,scheduler,label_smoothing,weight_decay,llrd_fact
 75,dinov2_large,2,5e-05,linear,0.05,0.01,0.85,False,False,False,none,0,0.8563,0.0186,0.8368,0.0139,0.8556,0.8538,187.9,1.5
 76,dinov2,2,0.0001,linear,0.05,0.01,0.85,False,False,False,none,0,0.8499,0.0148,0.8227,0.0210,0.8435,0.8433,78.5,1.0
 77,dinov2,2,0.0001,linear,0.05,0.01,0.85,False,False,False,none,0,0.8406,0.0198,0.8215,0.0251,0.8433,0.8373,117.7,1.0
+78,dinov2_large,2,0.0001,linear,0.05,0.01,0.65,False,False,False,none,0,0.8610,0.0234,0.8427,0.0206,0.8621,0.8597,331.1,2.7
+79,dinov2_large,2,0.0001,linear,0.05,0.01,0.75,False,False,False,none,0,0.8647,0.0301,0.8420,0.0269,0.8594,0.8598,387.3,2.1
+80,dinov2_large,2,0.0001,linear,0.05,0.01,0.75,False,False,False,none,0,0.8739,0.0155,0.8525,0.0112,0.8689,0.8721,346.5,1.5
+81,dinov2_large,2,0.0001,cosine,0.05,0.01,0.75,False,False,False,none,0,0.8610,0.0202,0.8432,0.0149,0.8626,0.8598,181.7,1.4
+82,dinov2_large,4,0.0001,linear,0.05,0.01,0.65,False,False,False,none,0,0.8711,0.0230,0.8523,0.0210,0.8724,0.8704,200.3,1.4
+83,dinov2_large,2,0.0002,linear,0.05,0.01,0.65,False,False,False,none,0,0.8563,0.0310,0.8381,0.0287,0.8613,0.8528,187.1,1.5
+84,dinov2,2,0.0001,cosine,0.05,0.01,0.85,False,False,False,none,0,0.8415,0.0209,0.8185,0.0290,0.8391,0.8390,39.9,1.0

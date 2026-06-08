@@ -1,12 +1,11 @@
 SELECTED_MODELS = [
-    "dinov2",
-    "dinov2_large",
+    "siglip2_so400m_512",
 ]
 
 GPU_MEMORY_FRACTION = 0.85
 
 SEED = 42
-TRAIN_DIR = "data/train"
+TRAIN_DIR = __import__("os").environ.get("TRAIN_DIR", "data/train")
 NUM_EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 5e-5
@@ -30,7 +29,12 @@ USE_COLOR_JITTER = False       # Hurts ConvNeXt (−1.76%); disabled
 USE_RANDAUGMENT = False        # Best DINOv2 config (84.24%) used no augmentation
 USE_RANDOM_ERASING = False     # Marginal in full stack; disabled until more data
 USE_LORA = False               # LoRA adapters (dinov2 / vit only); overrides freeze strategy
-USE_CLASS_ROUTING = True       # Class-routed weighted ensemble using per-class val F1 as weights
+USE_CLASS_ROUTING = True       # Hard class routing: log-prob z-score + column-select by best per-class val F1
+USE_PSEUDO_LABEL = False       # Disabled for solo validation run
+PSEUDO_LABEL_THRESHOLD = 0.97  # Min softmax confidence to accept a pseudo-label
+USE_CLASS_WEIGHTS = False      # Hurts all models (SigLIP-Base -0.75%, DINOv2-Large -2.13%); disabled
+USE_UPSAMPLE_BALANCE = False   # Disabled for solo validation run
+UPSAMPLE_MIN_COUNT = 20        # Target minimum images per class (never downsamples majority classes)
 LORA_R = 8                     # LoRA rank (4/8/16)
 LLRD_FACTOR = 0.75
 PROGRESSIVE_UNFREEZE_EPOCH = 3

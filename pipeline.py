@@ -4,9 +4,20 @@ import os
 import subprocess
 import time
 
+# Load .env for HF_TOKEN (needed for gated models like DINOv3)
+_env = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env):
+    with open(_env) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+from collections import Counter
+
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import Dataset, concatenate_datasets, load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import StratifiedKFold
 from transformers import TrainingArguments, set_seed
@@ -20,12 +31,15 @@ from config import (
     N_FOLDS,
     NUM_EPOCHS,
     PROGRESSIVE_UNFREEZE_EPOCH,
+    PSEUDO_LABEL_THRESHOLD,
     SEED,
     SELECTED_MODELS,
     TRAIN_DIR,
     TTA_AUGMENTS,
     UNFREEZE_BLOCKS,
+    UPSAMPLE_MIN_COUNT,
     USE_CLASS_ROUTING,
+    USE_CLASS_WEIGHTS,
     USE_COLOR_JITTER,
     USE_CUTMIX,
     USE_ENSEMBLE,
@@ -33,9 +47,11 @@ from config import (
     USE_LORA,
     USE_MIXUP,
     USE_PROGRESSIVE_UNFREEZE,
+    USE_PSEUDO_LABEL,
     USE_RANDAUGMENT,
     USE_RANDOM_ERASING,
     USE_TTA,
+    USE_UPSAMPLE_BALANCE,
 )
 from models import MODELS
 from resulter import build_run_config_lines, export_per_class_csv, export_results, print_results
@@ -80,58 +96,62 @@ def compute_metrics(p):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    # parser.add_argument("--export", default="pipeline_results.txt", type=str, metavar="FILE", help="Save results to a text file")
-    parser.add_argument("--export", type=str, metavar="FILE", help="Save results to a text file")
-    parser.add_argument("--submit", action="store_true", help="Submit generated submission CSV to Kaggle after training")
-    parser.add_argument("--message", type=str, default="pipeline run", metavar="MSG", help="Kaggle submission message (used with --submit)")
-    args = parser.parse_args()
+def _build_class_weights(dataset, num_labels):
+    """Compute inverse-frequency class weights normalized to mean=1."""
+    counts = Counter(dataset["label"])
+    weights = torch.zeros(num_labels)
+    for i in range(num_labels):
+        weights[i] = 1.0 / max(counts.get(i, 1), 1)
+    weights = weights / weights.mean()
+    return weights
 
-    set_seed(SEED)
 
-    if torch.cuda.is_available():
-        gpu = torch.cuda.get_device_properties(0)
-        total_gb = gpu.total_memory / 1024**3
-        torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
-        print(f"GPU: {gpu.name} ({total_gb:.1f} GB, using {GPU_MEMORY_FRACTION*100:.0f}% = {total_gb * GPU_MEMORY_FRACTION:.1f} GB)")
-    else:
-        print("WARNING: No CUDA GPU detected — training will run on CPU")
+def _upsample_to_minimum(raw_fold, min_count):
+    """Add copies of rare-class images until each class has min_count examples.
+    Only upsamples; never removes examples from majority classes.
+    Applied to the training fold only — val fold always uses real images.
+    The random train transform applied at batch time provides augmentation variety."""
+    labels = raw_fold["label"]
+    counts = Counter(labels)
+    extras = {"image": [], "label": []}
+    for cls, count in counts.items():
+        needed = min_count - count
+        if needed > 0:
+            cls_indices = [i for i, l in enumerate(labels) if l == cls]
+            for j in range(needed):
+                extras["image"].append(raw_fold[cls_indices[j % len(cls_indices)]]["image"])
+                extras["label"].append(cls)
+    if extras["image"]:
+        extra_ds = Dataset.from_dict(extras, features=raw_fold.features)
+        upsampled = concatenate_datasets([raw_fold, extra_ds])
+        n_added = len(extras["image"])
+        n_classes = sum(1 for c in counts if counts[c] < min_count)
+        print(f"  Upsampled {n_classes} rare classes (+{n_added} images, {len(raw_fold)}->{len(upsampled)} total)")
+        return upsampled
+    return raw_fold
 
-    full_dataset = load_dataset("imagefolder", data_files={"train": os.path.join(TRAIN_DIR, "**")})["train"]
 
-    class_names = full_dataset.features["label"].names
-    num_labels = len(class_names)
-    label2id = {label: str(i) for i, label in enumerate(class_names)}
-    id2label = {str(i): label for i, label in enumerate(class_names)}
-    all_label_ids = list(range(num_labels))
-
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    fold_splits = list(skf.split(range(len(full_dataset)), full_dataset["label"]))
-
+def run_training_loop(
+    train_dir, full_dataset, class_names, num_labels, label2id, id2label,
+    all_label_ids, fold_splits, selected, image_paths, test_ids,
+    suffix="", store_fold_models=True,
+):
+    """Train all selected models with K-fold CV. Returns (results, fold_models_by_name, val_probs_by_fold, val_tf_by_name)."""
     results = {}
-    selected = [cfg for cfg in MODELS if cfg["name"] in SELECTED_MODELS]
+    all_fold_models_by_name = {}
+    all_val_probs_by_fold = {}
+    all_val_tf_by_name = {}
+    _fmt = lambda s: f"{s/60:.1f}m" if s >= 60 else f"{s:.0f}s"
 
-    # Pre-compute test paths once (shared across all models)
-    data_root = os.path.dirname(TRAIN_DIR)
-    test_dir = os.path.join(data_root, "test")
-    test_ids, image_paths = [], []
-    if os.path.isdir(test_dir):
-        test_ids = sorted(
-            [f for f in os.listdir(test_dir) if f.lower().endswith(".jpg")],
-            key=lambda x: int(x.split(".")[0]),
-        )
-        image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
-
-    # For class-routing: track fold models and val probs keyed by model name
-    all_fold_models_by_name = {}   # name -> list[fold models on CPU]
-    all_val_probs_by_fold = {}     # name -> list[(val_idx, probs (N, C))]
-    all_val_tf_by_name = {}        # name -> val_transform
+    class_weights = None
+    if USE_CLASS_WEIGHTS:
+        class_weights = _build_class_weights(full_dataset, num_labels)
+        print(f"Class weights enabled — min={class_weights.min():.3f}  max={class_weights.max():.3f}")
 
     for model_cfg in selected:
         name = model_cfg["name"]
         print(f"\n{'='*60}")
-        print(f"Training: {name} ({model_cfg['model_id']})  [{N_FOLDS}-fold CV]")
+        print(f"Training: {name} ({model_cfg['model_id']})  [{N_FOLDS}-fold CV]{' [pseudo]' if suffix else ''}")
         print(f"{'='*60}")
         signal("model_start", model=name, folds=N_FOLDS)
 
@@ -160,13 +180,15 @@ def main():
         fold_models = []
         fold_train_sec = []
         fold_eval_sec = []
-        _fmt = lambda s: f"{s/60:.1f}m" if s >= 60 else f"{s:.0f}s"
 
         for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
             print(f"\n  -- Fold {fold_idx + 1}/{N_FOLDS} --")
 
-            train_fold = full_dataset.select(train_idx).with_transform(train_tf)
-            val_fold = full_dataset.select(val_idx).with_transform(val_tf)
+            train_fold_raw = full_dataset.select(train_idx)
+            if USE_UPSAMPLE_BALANCE:
+                train_fold_raw = _upsample_to_minimum(train_fold_raw, UPSAMPLE_MIN_COUNT)
+            train_fold = train_fold_raw.with_transform(train_tf)
+            val_fold   = full_dataset.select(val_idx).with_transform(val_tf)
 
             model = model_cfg["get_model"](num_labels, label2id, id2label)
 
@@ -190,7 +212,7 @@ def main():
                 callbacks.append(ProgressiveUnfreezeCallback(name, PROGRESSIVE_UNFREEZE_EPOCH))
 
             training_args = TrainingArguments(
-                output_dir=os.path.join(model_cfg["output_dir"], f"fold_{fold_idx}"),
+                output_dir=os.path.join(model_cfg["output_dir"] + suffix, f"fold_{fold_idx}"),
                 do_train=True,
                 do_eval=True,
                 num_train_epochs=model_epochs,
@@ -222,13 +244,14 @@ def main():
                 llrd_factor=model_llrd if (USE_LLRD and not USE_LORA) else 1.0,
                 model_name=name,
                 use_mixup=USE_MIXUP or USE_CUTMIX,
+                class_weights=class_weights,
             )
 
             t0 = time.perf_counter()
             trainer.train()
             train_sec = time.perf_counter() - t0
 
-            trainer.data_collator = collate_fn  # plain collator — no mixup on val/train eval
+            trainer.data_collator = collate_fn
             t0 = time.perf_counter()
             preds_out = trainer.predict(val_fold)
             eval_sec = time.perf_counter() - t0
@@ -242,22 +265,20 @@ def main():
                 )
 
             fold_metrics.append({
-                "accuracy": accuracy_score(true, preds),
+                "accuracy":  accuracy_score(true, preds),
                 "precision": precision_score(true, preds, average="macro", zero_division=0),
-                "recall": recall_score(true, preds, average="macro", zero_division=0),
-                "f1": f1_score(true, preds, average="macro", zero_division=0),
+                "recall":    recall_score(true, preds, average="macro", zero_division=0),
+                "f1":        f1_score(true, preds, average="macro", zero_division=0),
             })
             fold_per_class_f1.append(f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
             fold_per_class_precision.append(precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
             fold_per_class_recall.append(recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
 
-            # training accuracy — evaluate on train split with val transforms (no aug)
             train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
             train_preds_out = trainer.predict(train_eval_fold)
             train_acc = accuracy_score(train_preds_out.label_ids,
                                        np.argmax(train_preds_out.predictions, axis=1))
             fold_train_acc.append(train_acc)
-
             fold_train_sec.append(train_sec)
             fold_eval_sec.append(eval_sec)
 
@@ -277,7 +298,13 @@ def main():
                 print(f"  Fold {fold_idx + 1} TTA:  acc={tta_acc:.4f}  f1={tta_f1:.4f}  (delta acc {tta_acc - fold_metrics[-1]['accuracy']:+.4f})")
 
             if USE_ENSEMBLE or USE_CLASS_ROUTING:
+                model.cpu()  # free VRAM before next fold loads its model from disk
                 fold_models.append(model)
+
+            # Free trainer, fold datasets, and flush before next fold
+            del trainer, train_fold, train_fold_raw, val_fold
+            torch.cuda.empty_cache()
+            import gc; gc.collect()
 
         mean = {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
         std  = {m: float(np.std( [f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
@@ -297,16 +324,16 @@ def main():
             "train_acc_std":  float(np.std(fold_train_acc)),
             "per_class": {
                 class_names[i]: {
-                    "f1": float(mean_per_class_f1[i]),
+                    "f1":        float(mean_per_class_f1[i]),
                     "precision": float(mean_per_class_precision[i]),
-                    "recall": float(mean_per_class_recall[i]),
+                    "recall":    float(mean_per_class_recall[i]),
                 }
                 for i in range(num_labels)
             },
             "total_train_sec": total_train,
-            "total_eval_sec": total_eval,
+            "total_eval_sec":  total_eval,
         }
-        if USE_CLASS_ROUTING:
+        if store_fold_models and USE_CLASS_ROUTING:
             all_fold_models_by_name[name] = fold_models[:]
             all_val_tf_by_name[name] = val_tf
 
@@ -333,7 +360,8 @@ def main():
         submission_models = fold_models if fold_models else [model]
 
         if image_paths:
-            submission_path = f"submission_{name}.csv"
+            sub_suffix = suffix.lstrip("_") + "_" if suffix else ""
+            submission_path = f"submission_{sub_suffix}{name}.csv"
             print(f"\n  Predicting {len(test_ids)} test images ({len(submission_models)} fold model(s))...")
             test_preds = predict_test_images(submission_models, image_paths, val_tf)
 
@@ -341,106 +369,287 @@ def main():
                 writer = csv.writer(sf)
                 writer.writerow(["ID", "Label"])
                 for img_id, pred in zip(test_ids, test_preds):
-                    # class_names are alphabetically sorted folder names ("0","1","10",...)
-                    # convert internal index back to the folder name (= Kaggle's integer label)
                     writer.writerow([img_id, int(class_names[int(pred)])])
             print(f"  Submission saved: {submission_path}")
 
-            if args.submit:
-                print(f"  Submitting to Kaggle...")
-                result = subprocess.run(
-                    [
-                        "kaggle", "competitions", "submit",
-                        "-c", "ucsc-cse-144-spring-2026-final-project",
-                        "-f", submission_path,
-                        "-m", args.message,
-                    ],
-                    capture_output=True, text=True,
-                )
-                if result.returncode == 0:
-                    print(f"  {result.stdout.strip()}")
-                else:
-                    print(f"  Kaggle submission failed: {result.stderr.strip()}")
+        if not store_fold_models:
+            # Free fold models immediately to prevent cross-model memory buildup
+            for _m in fold_models:
+                del _m
+            fold_models.clear()
+            import gc as _gc; _gc.collect()
+            torch.cuda.empty_cache()
 
-    # ── Class-routed ensemble ──────────────────────────────────────────────────
+    return results, all_fold_models_by_name, all_val_probs_by_fold, all_val_tf_by_name
+
+
+def _log_zscore(probs: np.ndarray) -> np.ndarray:
+    """Log-prob z-score normalisation across samples per class column.
+
+    Converts softmax probs → log space (≈ logits), then centres and scales
+    each class column to mean=0 std=1.  This removes inter-model calibration
+    differences so column-wise selection is on a comparable scale.
+    """
+    log_p = np.log(probs + 1e-9)                          # (N, C)
+    mu    = log_p.mean(axis=0, keepdims=True)              # (1, C)
+    sigma = log_p.std(axis=0, keepdims=True) + 1e-9        # (1, C)
+    return (log_p - mu) / sigma                            # (N, C)
+
+
+def _run_class_routing(results, all_fold_models_by_name, all_val_probs_by_fold, all_val_tf_by_name,
+                       full_dataset, class_names, num_labels, all_label_ids, fold_splits,
+                       image_paths, test_ids, args, suffix=""):
+    """Hard class routing: for each class use the model with highest per-class val F1.
+    Log-prob z-score normalisation removes inter-model calibration differences before
+    column-wise selection, so a peaked SigLIP2 column cannot dominate a flatter
+    DINOv2-Large column that is relatively more confident on that class.
+    """
+    model_names_only = [n for n in results if n != "routed_ensemble"]
+    # Tiebreak by overall accuracy so SigLIP2 wins when all models are equal.
+    model_priority = sorted(model_names_only,
+                            key=lambda n: results[n]["mean"]["accuracy"], reverse=True)
+
+    print(f"\n{'='*60}")
+    print(f"Hard-routed ensemble ({len(model_names_only)} models){' [pseudo]' if suffix else ''}")
+    print(f"{'='*60}")
+
+    # Build class → best-model mapping from per-class val F1.
+    best_model_for_class = []
+    for i, cls in enumerate(class_names):
+        best_name = model_priority[0]
+        best_f1   = -1.0
+        for name in model_priority:   # iterate highest→lowest so ties go to best model
+            f1 = results[name]["per_class"][cls]["f1"]
+            if f1 > best_f1:
+                best_f1   = f1
+                best_name = name
+        best_model_for_class.append(best_name)
+
+    from collections import Counter as _Counter
+    routing_counts = _Counter(best_model_for_class)
+    for name in model_priority:
+        print(f"  {name}: owns {routing_counts.get(name, 0)}/100 classes")
+
+    # Val CV evaluation — z-score within each fold independently (different model
+    # instance per fold; pooling would mix distributions from different weights).
+    ens_fold_metrics, ens_fold_per_class_f1 = [], []
+    ens_fold_per_class_precision, ens_fold_per_class_recall = [], []
+
+    for fold_idx, (_, val_idx) in enumerate(fold_splits):
+        # Normalise each model's val probs within this fold.
+        val_norm = {}
+        for name in model_names_only:
+            _, probs = all_val_probs_by_fold[name][fold_idx]   # (N_val, C)
+            val_norm[name] = _log_zscore(probs)
+
+        # Column-wise selection.
+        n_val     = len(val_idx)
+        hard_probs = np.zeros((n_val, num_labels), dtype=np.float32)
+        for cls_idx in range(num_labels):
+            name = best_model_for_class[cls_idx]
+            hard_probs[:, cls_idx] = val_norm[name][:, cls_idx]
+
+        preds = hard_probs.argmax(axis=1)
+        true  = np.array(full_dataset.select(val_idx)["label"])
+
+        ens_fold_metrics.append({
+            "accuracy":  accuracy_score(true, preds),
+            "precision": precision_score(true, preds, average="macro", zero_division=0),
+            "recall":    recall_score(true, preds, average="macro", zero_division=0),
+            "f1":        f1_score(true, preds, average="macro", zero_division=0),
+        })
+        ens_fold_per_class_f1.append(f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+        ens_fold_per_class_precision.append(precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+        ens_fold_per_class_recall.append(recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+
+    ens_mean = {m: float(np.mean([f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
+    ens_std  = {m: float(np.std( [f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
+
+    results["routed_ensemble"] = {
+        "folds":           ens_fold_metrics,
+        "mean":            ens_mean,
+        "std":             ens_std,
+        "train_acc_mean":  float("nan"),
+        "train_acc_std":   0.0,
+        "per_class": {
+            class_names[i]: {
+                "f1":        float(np.mean(ens_fold_per_class_f1, axis=0)[i]),
+                "precision": float(np.mean(ens_fold_per_class_precision, axis=0)[i]),
+                "recall":    float(np.mean(ens_fold_per_class_recall, axis=0)[i]),
+            }
+            for i in range(num_labels)
+        },
+        "total_train_sec": 0.0,
+        "total_eval_sec":  0.0,
+    }
+    print(f"  acc={ens_mean['accuracy']:.4f}+/-{ens_std['accuracy']:.4f}"
+          f"  f1={ens_mean['f1']:.4f}+/-{ens_std['f1']:.4f}")
+
+    if image_paths:
+        # Test inference — z-score across all test samples (ensemble-averaged per model).
+        test_norm = {}
+        for name in model_names_only:
+            raw = get_test_probs(all_fold_models_by_name[name], image_paths, all_val_tf_by_name[name])
+            test_norm[name] = _log_zscore(raw)
+
+        final_probs = np.zeros((len(image_paths), num_labels), dtype=np.float32)
+        for cls_idx in range(num_labels):
+            name = best_model_for_class[cls_idx]
+            final_probs[:, cls_idx] = test_norm[name][:, cls_idx]
+
+        routed_test = final_probs.argmax(axis=1)
+        sub_suffix  = suffix.lstrip("_") + "_" if suffix else ""
+        routed_path = f"submission_{sub_suffix}routed.csv"
+        with open(routed_path, "w", newline="") as sf:
+            writer = csv.writer(sf)
+            writer.writerow(["ID", "Label"])
+            for img_id, pred in zip(test_ids, routed_test):
+                writer.writerow([img_id, int(class_names[int(pred)])])
+        print(f"  Hard-routed submission saved: {routed_path}")
+
+        if args.submit:
+            print(f"  Submitting {routed_path} to Kaggle...")
+            result = subprocess.run(
+                ["kaggle", "competitions", "submit",
+                 "-c", "ucsc-cse-144-spring-2026-final-project",
+                 "-f", routed_path, "-m", args.message],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                print(f"  {result.stdout.strip()}")
+            else:
+                print(f"  Kaggle submission failed: {result.stderr.strip()}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--export", type=str, metavar="FILE", help="Save results to a text file")
+    parser.add_argument("--submit", action="store_true", help="Submit generated submission CSV to Kaggle after training")
+    parser.add_argument("--message", type=str, default="pipeline run", metavar="MSG", help="Kaggle submission message (used with --submit)")
+    args = parser.parse_args()
+
+    set_seed(SEED)
+
+    if torch.cuda.is_available():
+        gpu = torch.cuda.get_device_properties(0)
+        total_gb = gpu.total_memory / 1024**3
+        torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
+        print(f"GPU: {gpu.name} ({total_gb:.1f} GB, using {GPU_MEMORY_FRACTION*100:.0f}% = {total_gb * GPU_MEMORY_FRACTION:.1f} GB)")
+    else:
+        print("WARNING: No CUDA GPU detected — training will run on CPU")
+
+    full_dataset = load_dataset("imagefolder", data_files={"train": os.path.join(TRAIN_DIR, "**")})["train"]
+
+    class_names = full_dataset.features["label"].names
+    num_labels = len(class_names)
+    label2id = {label: str(i) for i, label in enumerate(class_names)}
+    id2label = {str(i): label for i, label in enumerate(class_names)}
+    all_label_ids = list(range(num_labels))
+
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    fold_splits = list(skf.split(range(len(full_dataset)), full_dataset["label"]))
+
+    selected = [cfg for cfg in MODELS if cfg["name"] in SELECTED_MODELS]
+
+    data_root = os.path.dirname(TRAIN_DIR)
+    test_dir  = os.path.join(data_root, "test")
+    test_ids, image_paths = [], []
+    if os.path.isdir(test_dir):
+        test_ids = sorted(
+            [f for f in os.listdir(test_dir) if f.lower().endswith(".jpg")],
+            key=lambda x: int(x.split(".")[0]),
+        )
+        image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
+
+    # ── Round 1: train on real data ────────────────────────────────────────────
+    results, fold_models_by_name, val_probs_by_fold, val_tf_by_name = run_training_loop(
+        TRAIN_DIR, full_dataset, class_names, num_labels, label2id, id2label,
+        all_label_ids, fold_splits, selected, image_paths, test_ids,
+    )
+
     if USE_CLASS_ROUTING and len(results) > 1:
-        model_names_only = list(results.keys())
+        results = _run_class_routing(
+            results, fold_models_by_name, val_probs_by_fold, val_tf_by_name,
+            full_dataset, class_names, num_labels, all_label_ids, fold_splits,
+            image_paths, test_ids, args,
+        )
+
+    # ── Round 2: pseudo-labeling ───────────────────────────────────────────────
+    if USE_PSEUDO_LABEL and image_paths:
         print(f"\n{'='*60}")
-        print(f"Class-routed ensemble ({len(model_names_only)} models)")
+        print(f"Pseudo-labeling (threshold={PSEUDO_LABEL_THRESHOLD})")
         print(f"{'='*60}")
 
-        # Per-class F1 weights: (C,) per model
-        weights_by_name = {
-            name: np.array([results[name]["per_class"][cls]["f1"] for cls in class_names], dtype=np.float32)
-            for name in model_names_only
-        }
+        # Use strongest model only for pseudo-label generation (knowledge distillation).
+        # Blending weaker models lowers softmax confidence and adds noise to pseudo-labels.
+        _pseudo_src = max(
+            (n for n in fold_models_by_name if n in results),
+            key=lambda n: results[n]["mean"]["accuracy"],
+        )
+        print(f"  Pseudo-label source: {_pseudo_src} (acc={results[_pseudo_src]['mean']['accuracy']:.4f})")
+        test_probs = get_test_probs(
+            fold_models_by_name[_pseudo_src], image_paths, val_tf_by_name[_pseudo_src]
+        )
 
-        # Validate on each fold using stored val probs
-        ens_fold_metrics = []
-        ens_fold_per_class_f1 = []
-        ens_fold_per_class_precision = []
-        ens_fold_per_class_recall = []
+        # Free round-1 models before round-2 to avoid Windows page-file OOM
+        del fold_models_by_name
+        import torch as _torch; _torch.cuda.empty_cache()
 
-        for fold_idx, (_, val_idx) in enumerate(fold_splits):
-            routed = np.zeros((len(val_idx), num_labels), dtype=np.float32)
-            for name in model_names_only:
-                _, probs = all_val_probs_by_fold[name][fold_idx]
-                routed += probs * weights_by_name[name]
+        max_probs     = test_probs.max(axis=1)
+        pseudo_labels = test_probs.argmax(axis=1)
+        confident_mask = max_probs >= PSEUDO_LABEL_THRESHOLD
+        n_pseudo = int(confident_mask.sum())
+        print(f"  Accepting {n_pseudo}/{len(test_ids)} pseudo-labels (conf>={PSEUDO_LABEL_THRESHOLD})")
 
-            preds = routed.argmax(axis=1)
-            true = np.array(full_dataset.select(val_idx)["label"])
+        if n_pseudo > 0:
+            # Build pseudo dataset in memory using PIL images
+            from datasets import Dataset, Features, ClassLabel, Image as HFImage
+            from PIL import Image as PILImage
 
-            ens_fold_metrics.append({
-                "accuracy":  accuracy_score(true, preds),
-                "precision": precision_score(true, preds, average="macro", zero_division=0),
-                "recall":    recall_score(true, preds, average="macro", zero_division=0),
-                "f1":        f1_score(true, preds, average="macro", zero_division=0),
-            })
-            ens_fold_per_class_f1.append(
-                f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
-            ens_fold_per_class_precision.append(
-                precision_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
-            ens_fold_per_class_recall.append(
-                recall_score(true, preds, labels=all_label_ids, average=None, zero_division=0))
+            pseudo_images, pseudo_label_list = [], []
+            for i, fpath in enumerate(image_paths):
+                if confident_mask[i]:
+                    pseudo_images.append(PILImage.open(fpath).convert("RGB"))
+                    pseudo_label_list.append(int(pseudo_labels[i]))
 
-        ens_mean = {m: float(np.mean([f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
-        ens_std  = {m: float(np.std( [f[m] for f in ens_fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")}
+            # Concatenate with original training set (val is always real data only)
+            orig_images = [full_dataset[i]["image"] for i in range(len(full_dataset))]
+            orig_labels = full_dataset["label"]
 
-        results["routed_ensemble"] = {
-            "folds":           ens_fold_metrics,
-            "mean":            ens_mean,
-            "std":             ens_std,
-            "train_acc_mean":  float("nan"),
-            "train_acc_std":   0.0,
-            "per_class": {
-                class_names[i]: {
-                    "f1":        float(np.mean(ens_fold_per_class_f1, axis=0)[i]),
-                    "precision": float(np.mean(ens_fold_per_class_precision, axis=0)[i]),
-                    "recall":    float(np.mean(ens_fold_per_class_recall, axis=0)[i]),
-                }
-                for i in range(num_labels)
-            },
-            "total_train_sec": 0.0,
-            "total_eval_sec":  0.0,
-        }
-        print(f"  acc={ens_mean['accuracy']:.4f}+/-{ens_std['accuracy']:.4f}"
-              f"  f1={ens_mean['f1']:.4f}+/-{ens_std['f1']:.4f}")
+            combined_features = full_dataset.features
+            pseudo_dataset = Dataset.from_dict(
+                {"image": orig_images + pseudo_images, "label": list(orig_labels) + pseudo_label_list},
+                features=combined_features,
+            )
 
-        # Test inference: generate submission_routed.csv
-        if image_paths:
-            all_weighted_probs = []
-            for name in model_names_only:
-                probs = get_test_probs(all_fold_models_by_name[name], image_paths, all_val_tf_by_name[name])
-                all_weighted_probs.append(probs * weights_by_name[name])
-            routed_test = sum(all_weighted_probs).argmax(axis=1)
-            routed_path = "submission_routed.csv"
-            with open(routed_path, "w", newline="") as sf:
-                writer = csv.writer(sf)
-                writer.writerow(["ID", "Label"])
-                for img_id, pred in zip(test_ids, routed_test):
-                    writer.writerow([img_id, int(class_names[int(pred)])])
-            print(f"  Routed submission saved: {routed_path}")
+            print(f"  Combined dataset: {len(full_dataset)} real + {n_pseudo} pseudo = {len(pseudo_dataset)} total")
 
+            # Reuse same fold splits (val indices are real-data only; pseudo images are beyond len(full_dataset))
+            results_pseudo, fold_models_pseudo, val_probs_pseudo, val_tf_pseudo = run_training_loop(
+                TRAIN_DIR, pseudo_dataset, class_names, num_labels, label2id, id2label,
+                all_label_ids, fold_splits, selected, image_paths, test_ids,
+                suffix="_pseudo", store_fold_models=False,
+            )
+
+            if USE_CLASS_ROUTING and len(results_pseudo) > 1:
+                # Pass empty image_paths: CV metrics only, skip test inference (fold models freed)
+                results_pseudo = _run_class_routing(
+                    results_pseudo, fold_models_pseudo, val_probs_pseudo, val_tf_pseudo,
+                    pseudo_dataset, class_names, num_labels, all_label_ids, fold_splits,
+                    [], test_ids, args, suffix="_pseudo",
+                )
+
+            print(f"\n  Pseudo-label comparison (val acc):")
+            for mname in SELECTED_MODELS:
+                r1 = results.get(mname, {}).get("mean", {}).get("accuracy", float("nan"))
+                r2 = results_pseudo.get(mname, {}).get("mean", {}).get("accuracy", float("nan"))
+                print(f"    {mname}: {r1:.4f} -> {r2:.4f}  ({r2 - r1:+.4f})")
+        else:
+            print("  No confident pseudo-labels above threshold; skipping round 2.")
+
+    # ── Summary and export ─────────────────────────────────────────────────────
     run_cfg = {
         "selected_models": SELECTED_MODELS,
         "num_epochs": NUM_EPOCHS,
@@ -463,6 +672,9 @@ def main():
         "use_tta": USE_TTA,
         "tta_augments": TTA_AUGMENTS,
         "use_ensemble": USE_ENSEMBLE,
+        "use_pseudo_label": USE_PSEUDO_LABEL,
+        "pseudo_label_threshold": PSEUDO_LABEL_THRESHOLD,
+        "use_class_weights": USE_CLASS_WEIGHTS,
     }
     run_cfg_lines = build_run_config_lines(run_cfg)
     print_results(results, class_names, num_labels, N_FOLDS, run_cfg_lines)

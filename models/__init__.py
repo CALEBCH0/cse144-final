@@ -1,3 +1,18 @@
+from models.siglip2_so400m import MODEL_ID as SIGLIP2_SO400M_MODEL_ID
+from models.siglip2_so400m import get_model as get_siglip2_so400m
+from models.siglip2_so400m import get_processor as get_siglip2_so400m_processor
+from models.siglip2_so400m_512 import MODEL_ID as SIGLIP2_SO400M_512_MODEL_ID
+from models.siglip2_so400m_512 import get_model as get_siglip2_so400m_512
+from models.siglip2_so400m_512 import get_processor as get_siglip2_so400m_512_processor
+from models.siglip import MODEL_ID as SIGLIP_MODEL_ID
+from models.siglip import get_model as get_siglip
+from models.siglip import get_processor as get_siglip_processor
+from models.clip_vit import MODEL_ID as CLIP_VIT_MODEL_ID
+from models.clip_vit import get_model as get_clip_vit
+from models.clip_vit import get_processor as get_clip_vit_processor
+from models.dinov2_giant import MODEL_ID as DINOV2_GIANT_MODEL_ID
+from models.dinov2_giant import get_model as get_dinov2_giant
+from models.dinov2_giant import get_processor as get_dinov2_giant_processor
 from models.convnext import MODEL_ID as CONVNEXT_MODEL_ID
 from models.convnext import get_model as get_convnext
 from models.convnext import get_processor as get_convnext_processor
@@ -7,6 +22,9 @@ from models.convnext_tiny import get_processor as get_convnext_tiny_processor
 from models.dinov2 import MODEL_ID as DINOV2_MODEL_ID
 from models.dinov2 import get_model as get_dinov2
 from models.dinov2 import get_processor as get_dinov2_processor
+from models.dinov3 import MODEL_ID as DINOV3_MODEL_ID
+from models.dinov3 import get_model as get_dinov3
+from models.dinov3 import get_processor as get_dinov3_processor
 from models.dinov2_large import MODEL_ID as DINOV2_LARGE_MODEL_ID
 from models.dinov2_large import get_model as get_dinov2_large
 from models.dinov2_large import get_processor as get_dinov2_large_processor
@@ -28,6 +46,17 @@ from models.vit import get_processor as get_vit_processor
 
 MODELS = [
     {
+        "name": "dinov3",
+        "model_id": DINOV3_MODEL_ID,
+        "get_model": get_dinov3,
+        "get_processor": get_dinov3_processor,
+        "output_dir": "checkpoints/dinov3",
+        "learning_rate": 1e-4,
+        "llrd_factor": 0.75,     # same as dinov2_large (same model size)
+        "num_epochs": 50,         # start same as dinov2_large; may tune later
+        "unfreeze_blocks": 2,     # conservative start; same as dinov2_large best
+    },
+    {
         "name": "dinov2",
         "model_id": DINOV2_MODEL_ID,
         "get_model": get_dinov2,
@@ -44,9 +73,9 @@ MODELS = [
         "get_model": get_dinov2_large,
         "get_processor": get_dinov2_large_processor,
         "output_dir": "checkpoints/dinov2_large",
-        "learning_rate": 1e-4,   # cfg 72: best large config (86.84%)
+        "learning_rate": 1e-4,   # cfg 80: best large config (87.39%)
         "llrd_factor": 0.75,
-        "num_epochs": 30,        # large benefits from 30ep without overfitting
+        "num_epochs": 50,        # cfg 80: 50ep best; 30ep was 86.47%
         "unfreeze_blocks": 2,
     },
     {
@@ -106,4 +135,60 @@ MODELS = [
         "get_processor": get_vit_processor,
         "output_dir": "checkpoints/vit",
     },
+    {
+        "name": "siglip2_so400m",
+        "model_id": SIGLIP2_SO400M_MODEL_ID,
+        "get_model": get_siglip2_so400m,
+        "get_processor": get_siglip2_so400m_processor,
+        "output_dir": "checkpoints/siglip2_so400m",
+        "learning_rate": 1e-4,
+        "llrd_factor": 0.8,
+        "unfreeze_blocks": 2,   # cfg 104 best: unfreeze=2, 20ep → 95.00% (vs unfreeze=4 94.81%, unfreeze=6 94.35%)
+        "num_epochs": 20,
+    },
+    {
+        "name": "siglip2_so400m_512",
+        "model_id": SIGLIP2_SO400M_512_MODEL_ID,
+        "get_model": get_siglip2_so400m_512,
+        "get_processor": get_siglip2_so400m_512_processor,
+        "output_dir": "checkpoints/siglip2_so400m_512",
+        "learning_rate": 1e-4,
+        "llrd_factor": 0.8,
+        "unfreeze_blocks": 6,
+        "num_epochs": 15,
+        "batch_size": 8,        # 1024 tokens at 512px — needs smaller batch
+    },
+    {
+        "name": "siglip",
+        "model_id": SIGLIP_MODEL_ID,
+        "get_model": get_siglip,
+        "get_processor": get_siglip_processor,
+        "output_dir": "checkpoints/siglip",
+        "learning_rate": 1e-4,
+        "unfreeze_blocks": 2,
+        "num_epochs": 10,
+    },
+    {
+        "name": "clip_vit",
+        "model_id": CLIP_VIT_MODEL_ID,
+        "get_model": get_clip_vit,
+        "get_processor": get_clip_vit_processor,
+        "output_dir": "checkpoints/clip_vit",
+        "learning_rate": 1e-4,
+        "unfreeze_blocks": 2,
+        "num_epochs": 10,
+    },
+    # TODO: requires gradient_checkpointing, ~4h/run — add to SELECTED_MODELS when ready
+    # {
+    #     "name": "dinov2_giant",
+    #     "model_id": DINOV2_GIANT_MODEL_ID,
+    #     "get_model": get_dinov2_giant,
+    #     "get_processor": get_dinov2_giant_processor,
+    #     "output_dir": "checkpoints/dinov2_giant",
+    #     "learning_rate": 1e-4,
+    #     "llrd_factor": 0.75,
+    #     "num_epochs": 30,
+    #     "unfreeze_blocks": 2,
+    #     "batch_size": 8,
+    # },
 ]

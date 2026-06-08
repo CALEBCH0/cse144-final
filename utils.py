@@ -16,7 +16,7 @@ def _count_transformer_layers(model):
     """Detect number of encoder blocks by scanning named parameters."""
     max_idx = -1
     for name, _ in model.named_parameters():
-        for prefix in ("encoder.layer.", "layers.", "timm_model.blocks."):
+        for prefix in ("encoder.layer.", "layers.", "model.layer.", "timm_model.blocks."):
             if prefix in name:
                 try:
                     idx = int(name.split(prefix)[1].split(".")[0])
@@ -47,6 +47,7 @@ def apply_freeze(model, model_name, unfreeze_blocks):
             for name, param in model.named_parameters():
                 for i in range(n - unfreeze_blocks, n):
                     if (f"encoder.layer.{i}." in name or f"layers.{i}." in name
+                            or f"model.layer.{i}." in name
                             or f"timm_model.blocks.{i}." in name):
                         param.requires_grad = True
 
@@ -68,7 +69,9 @@ def get_llrd_optimizer(model, model_name, base_lr, decay_factor, weight_decay):
     """
     groups = []
 
-    if model_name in ("dinov2", "dinov2_large", "vit"):
+    if model_name in ("dinov2", "dinov2_large", "dinov3", "vit",
+                      "siglip", "clip_vit",
+                      "siglip2_so400m", "siglip2_so400m_512"):
         n = _count_transformer_layers(model)
         # embeddings — lowest LR
         emb_params = [p for n_, p in model.named_parameters()
@@ -82,6 +85,7 @@ def get_llrd_optimizer(model, model_name, base_lr, decay_factor, weight_decay):
         for i in range(n):
             layer_params = [p for n_, p in model.named_parameters()
                             if (f"encoder.layer.{i}." in n_ or f"layers.{i}." in n_
+                                or f"model.layer.{i}." in n_
                                 or f"timm_model.blocks.{i}." in n_)
                             and p.requires_grad]
             if layer_params:
@@ -151,11 +155,12 @@ class CustomTrainer(Trainer):
         use_mixup    (bool):  if True, expects float soft labels from MixupCollator.
     """
 
-    def __init__(self, *args, llrd_factor=1.0, model_name="", use_mixup=False, **kwargs):
+    def __init__(self, *args, llrd_factor=1.0, model_name="", use_mixup=False, class_weights=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.llrd_factor = llrd_factor
         self.model_name_for_llrd = model_name
         self.use_mixup = use_mixup
+        self.class_weights = class_weights
 
     def create_optimizer(self):
         if self.llrd_factor < 1.0:
@@ -175,8 +180,9 @@ class CustomTrainer(Trainer):
         logits = outputs.logits
 
         if labels.dtype == torch.float:
-            # soft labels from Mixup — use manual cross-entropy
             loss = F.cross_entropy(logits, labels)
+        elif self.class_weights is not None:
+            loss = F.cross_entropy(logits, labels, weight=self.class_weights.to(logits.device))
         else:
             loss = F.cross_entropy(logits, labels)
 
@@ -191,6 +197,10 @@ class EpochAccuracyCallback(TrainerCallback):
     train_eval_dataset  — training split with val transforms (no augmentation).
     val_eval_dataset    — validation split with val transforms.
     collate_fn          — plain collate (no mixup).
+
+    Always tracks the best val epoch and restores it at the end of training
+    (in-memory, no disk writes). This prevents accuracy regression when the
+    final epoch is not the best epoch.
     """
 
     def __init__(self, train_eval_dataset, val_eval_dataset, collate_fn, batch_size=32):
@@ -198,8 +208,12 @@ class EpochAccuracyCallback(TrainerCallback):
         self.val_ds   = val_eval_dataset
         self.collate  = collate_fn
         self.batch_size = batch_size
+        self._best_val_acc = -1.0
+        self._best_state = None
+        self._best_epoch = -1
 
     def _eval_acc(self, model, dataset, device):
+        import copy
         from torch.utils.data import DataLoader
         from sklearn.metrics import accuracy_score
         loader = DataLoader(dataset, batch_size=self.batch_size,
@@ -215,11 +229,26 @@ class EpochAccuracyCallback(TrainerCallback):
         return accuracy_score(labels, preds)
 
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        import copy
         device = next(model.parameters()).device
         tr_acc  = self._eval_acc(model, self.train_ds, device)
         val_acc = self._eval_acc(model, self.val_ds,   device)
         gap = tr_acc - val_acc
-        print(f"\n  [epoch {int(state.epoch):>2}]  train={tr_acc:.4f}  val={val_acc:.4f}  gap={gap:+.4f}")
+        epoch = int(state.epoch)
+        marker = ""
+        if val_acc > self._best_val_acc:
+            self._best_val_acc = val_acc
+            self._best_epoch = epoch
+            self._best_state = copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()})
+            marker = " *best"
+        print(f"\n  [epoch {epoch:>2}]  train={tr_acc:.4f}  val={val_acc:.4f}  gap={gap:+.4f}{marker}")
+
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if self._best_state is not None and self._best_epoch != int(state.epoch):
+            device = next(model.parameters()).device
+            model.load_state_dict({k: v.to(device) for k, v in self._best_state.items()})
+            print(f"\n  [BestEpoch] restored ep{self._best_epoch} val={self._best_val_acc:.4f} "
+                  f"(final was ep{int(state.epoch)})")
 
 
 # ── Progressive unfreezing ────────────────────────────────────────────────────

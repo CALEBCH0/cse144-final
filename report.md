@@ -4,7 +4,7 @@
 
 1. **Problem goal and setting.** _TODO_
 2. **Why transfer learning is appropriate.** _TODO_
-3. **Brief summary of approach and main result.** Five pretrained backbones (ResNet-50, ResNet-101, ConvNeXt-Base, ViT-B/16, DINOv2-Base, DINOv2-Large) were evaluated on a 100-class image classification task. DINOv2-Large with 2 unfrozen encoder layers, lr=1e-4, LLRD=0.75, and 30 epochs achieved the best 5-fold CV accuracy of **86.84%**.
+3. **Brief summary of approach and main result.** Eight pretrained backbones were evaluated on a 100-class image classification task with 119 hyperparameter configs. SigLIP2-SO400M-384 (google/siglip2-so400m-patch16-384) with 2 unfrozen layers, lr=1e-4, LLRD=0.8, 20 epochs achieved the best 5-fold CV accuracy of **95.27%** (run_004c, R2 with self-distillation pseudo-labeling). Kaggle public leaderboard score: **95.454%** (5th place).
 
 ---
 
@@ -79,7 +79,7 @@ Bold values reflect the best configuration found via hyperparameter search. DINO
 ## 4 Experiments
 
 1. **Baseline setup.** All three models trained with standard resize/flip augmentation, 5-fold stratified CV, AdamW, label smoothing 0.05. Results reported in sections 5.1–5.4.
-2. **Hyperparameter tuning method.** Grid search via `search.py`: each config trained with 5-fold stratified CV (batch=32). Results written incrementally to `search_results.csv` with resume support. 78 total configs covering unfreeze depth, LR, scheduler, label smoothing, weight decay, LLRD, augmentation stack, collator (Mixup/CutMix), LoRA rank, epoch count, and two DINOv2 model sizes. Each config also generates a Kaggle-submittable CSV in `search_results/config_{i}_{model}.csv`. See section 5.5 for findings.
+2. **Hyperparameter tuning method.** Grid search via `search.py`: each config trained with 5-fold stratified CV (batch=32). Results written incrementally to `search_results.csv` with resume support. 95 total configs covering unfreeze depth, LR, scheduler, label smoothing, weight decay, LLRD, augmentation stack, collator (Mixup/CutMix), LoRA rank, epoch count, model sizes (Base/Large/518px), class-balanced loss, and new architectures (SigLIP, CLIP-ViT). Each config also generates a Kaggle-submittable CSV in `search_results/config_{i}_{model}.csv`. See section 5.5 for findings.
 3. **Ablation axes covered:**
    - Freeze depth: head-only → partial unfreeze (1–6 blocks) → full fine-tune
    - LR: 1e-5 to 3e-4 per model family
@@ -385,23 +385,275 @@ LLRD=0.65 hurts — aggressively cutting the LR on lower layers starves the uppe
 
 | config | epochs | acc | delta vs 30ep best |
 |---|---|---|---|
-| 72 | 30 | 0.8684 | — (best) |
+| 72 | 30 | 0.8684 | — |
 | 79 | 40 | 0.8647 | −0.37% |
-| 80 | 50 | _in progress_ | — |
+| **80** | **50** | **0.8739** | **+0.55%** |
 
-40 epochs does **not** improve over 30ep — in fact it slightly regresses (−0.37%). Despite fold 1 reaching 89.8% (vs 88.8% at 30ep), the mean drops once the harder folds are included. DINOv2-Large's optimal training window is 30 epochs; extending to 40ep suggests mild overfitting begins. Config 80 (50ep) is running to confirm the trend.
+**New overall best: 87.39%** (config 80: DINOv2-Large, 50ep, LLRD=0.75, unfreeze=2, lr=1e-4).
+
+The training curve is non-monotonic: 40ep dips below 30ep (−0.37%) before 50ep surpasses both (+0.55% over 30ep). This likely reflects fold-level variance and the optimizer traversing a loss plateau at 40ep; 50ep escapes it. The key finding is that DINOv2-Large's capacity is still not saturated at 30 epochs on this dataset, and 50ep delivers a meaningful gain without signs of catastrophic forgetting.
+
+#### 5.5.19 Cosine scheduler, deeper unfreeze, and higher LR (configs 81–84)
+
+| config | model | unfreeze | lr | LLRD | epochs | scheduler | acc | note |
+|---|---|---|---|---|---|---|---|---|
+| 72 (ref) | dinov2_large | 2 | 1e-4 | 0.75 | 30 | linear | 0.8684 | prior best |
+| 81 | dinov2_large | 2 | 1e-4 | 0.75 | 30 | **cosine** | 0.8610 | −0.74% |
+| **82** | **dinov2_large** | **4** | **1e-4** | **0.65** | **30** | linear | **0.8711** | **+0.27%** |
+| 83 | dinov2_large | 2 | **2e-4** | 0.65 | 30 | linear | 0.8563 | −1.21% |
+| 84 | dinov2 (base) | 2 | 1e-4 | 0.85 | 10 | cosine | 0.8415 | base cosine baseline |
+
+Key takeaways:
+- **Cosine scheduler hurts Large at 30ep** (0.8610 vs 0.8684 linear). Linear warmup-decay is consistently better for DINOv2-Large; cosine likely decays the LR too early, under-utilising later epochs.
+- **unfreeze=4 with LLRD=0.65 reaches 87.11%** — competitive with config 72, and within std overlap. Deeper unfreezing can recover when paired with an aggressively lower LLRD to protect the extra exposed layers. However, config 80 (50ep, unfreeze=2) at 87.39% is still superior: fewer exposed layers means less risk of overwriting pretrained representations.
+- **lr=2e-4 hurts** even with aggressive LLRD=0.65. The upper layers receive 2e-4 full LR on only ~860 training samples — too much gradient noise per step even with decay protection.
+- **DINOv2-base with cosine** (config 84) scores 84.15%, well below the best base config 64 (85.54% linear). Consistent with the finding that cosine degrades DINOv2 for both sizes.
+
+#### 5.5.20 518px resolution and RandAugment on DINOv2-Large (configs 85–87)
+
+| config | model | res | epochs | aug | acc | Δ vs 72 (30ep ref) |
+|---|---|---|---|---|---|---|
+| 72 (ref) | dinov2_large | 224px | 30 | none | 0.8684 | — |
+| 85 | dinov2_large_518 | **518px** | 30 | none | 0.7720 | **−9.64%** |
+| 86 | dinov2_large | 224px | 30 | **RandAugment** | 0.8693 | +0.09% |
+| 87 | dinov2_large_518 | **518px** | 30 | **RandAugment** | 0.7627 | −10.57% |
+
+Key takeaways:
+- **518px is definitively harmful: −9.64 pts vs 224px at identical settings.** DINOv2-Large was pretrained at 518px, but the fine-tuning regime with ~860 train images cannot support the 5× larger token sequence (1369 patches at 518px vs 256 at 224px). The expanded context introduces positional interpolation noise and drastically increases per-sample memory, forcing batch_size=16 (vs 32), which further destabilises gradient estimates at this dataset scale.
+- **The "more information at higher resolution" hypothesis is refuted.** Config 85 used 30 full epochs — sufficient for the 224px Large to reach 86.84% — yet 518px still yields only 77.2%. The bottleneck is not training duration but the mismatch between the positional embedding interpolation and the tiny fine-tuning set.
+- **RandAugment is neutral on DINOv2-Large at 224px** (86.93% vs 86.84%, +0.09%). This contrasts with DINOv2-Base where RA gave +0.93%. Large's higher capacity already generalises well from DINOv2 pretraining; augmentation offers no additional regularisation benefit. This is consistent with the earlier finding that Large can absorb 50 epochs without overfitting.
+- **RandAugment makes 518px worse** (76.27% vs 77.20%, −0.93%). Spatial augmentations compound the positional interpolation artefacts at high resolution. Both 518px configs are firmly ruled out.
+- **Best config remains config 80** (50ep, 224px, no aug): 87.39%.
+
+#### 5.5.21 SigLIP-Base baselines (configs 88–90)
+
+| config | model | epochs | class_weights | acc | note |
+|---|---|---|---|---|---|
+| 88 | siglip-base | 10 | no | 0.8332 | baseline |
+| 89 | siglip-base | 10 | yes | 0.8257 | −0.75% |
+| **90** | **siglip-base** | **20** | **no** | **0.8461** | **+1.29%** |
+
+SigLIP-Base (google/siglip-base-patch16-224, unfreeze=2, lr=1e-4) at 10 epochs reaches 83.3% — slightly below DINOv2-Base (85.54%) and well below DINOv2-Large (87.39%). Class weights hurt (same pattern as ConvNeXt and DINOv2-Large). Doubling epochs to 20 improves to 84.6%, suggesting SigLIP benefits from longer training; the gap to DINOv2-Large persists (~3 pts). SigLIP-Base is not competitive with DINOv2-Large for this task; the much larger SigLIP2-SO400M variant (configs 96+) addresses this.
+
+#### 5.5.22 CLIP-ViT-Large/14 baselines (configs 91–93) — failed, TODO
+
+All three CLIP-ViT configs (91: baseline, 92: +class weights, 93: 20ep) failed with `'CLIPClassifier' object has no attribute 'config'`. The custom `CLIPClassifier` wrapper (plain `nn.Module`) did not expose `.config`, which HuggingFace Trainer accesses internally. **Fix applied:** `self.config = self.vision_model.config` added to `CLIPClassifier.__init__`. **TODO:** rerun configs 91–93 to obtain CLIP-ViT-Large/14 baseline results.
+
+#### 5.5.23 DINOv2-Large + class weights and augmentation (configs 94–95)
+
+| config | model | epochs | class_weights | RandAug | acc | Δ vs 80 |
+|---|---|---|---|---|---|---|
+| 80 (ref) | dinov2_large | 50 | no | no | 0.8739 | — |
+| 94 | dinov2_large | 50 | **yes** | no | 0.8526 | **−2.13%** |
+| 95 | dinov2_large | 50 | **yes** | **yes** | 0.8665 | **−0.74%** |
+
+Class weights hurt DINOv2-Large by 2.13 pts, confirming the pattern seen in SigLIP-Base and ConvNeXt. Adding RandAugment partially offsets the damage (−0.74% net), but the combination still underperforms the clean baseline. **Class weights are disabled in the pipeline for all models.** The finding is consistent: inverse-frequency weighting distorts gradient balance in ways that outweigh any benefit from over-representing rare classes at this dataset scale.
+
+#### 5.5.24 SigLIP2-SO400M-384 — initial results (config 96, preliminary)
+
+Config 96 (conservative baseline: unfreeze=2, lr=1e-4, LLRD=0.8, 10ep, linear) running on Kaggle T4. Preliminary results (4/5 folds complete):
+
+| fold | acc | peak epoch |
+|---|---|---|
+| 1 | 0.9167 | ep7 (0.9306) |
+| 2 | **0.9676** | ep8 |
+| 3 | 0.9028 | ep5 (0.9167) |
+| 4 | 0.9352 | ep6 (0.9352) |
+| 5 | _pending_ | ep8: 0.9581 |
+
+Preliminary 4-fold mean: **~93.1%** — a +5.7 pt jump over DINOv2-Large (87.39%). SigLIP2-SO400M is a 400M-param ViT-So400M pretrained on image-text pairs at 384px. The gap is decisive: DINOv2-Large, SigLIP-Base, and CLIP-ViT are all outclassed.
+
+**Key observation:** fold 1 peaked at ep7 (93.06%) but the final epoch (ep10) used the ep10 weights (91.67%) — 1.39% left on the table. Same regression visible in fold 3 (ep5=91.67%, ep10=90.28%). This motivated the best-epoch recovery fix below.
+
+#### 5.5.25 Best-epoch in-memory recovery
+
+All previous configs used `load_best_model_at_end=False` (eval_strategy="no"), meaning the last epoch's weights were always used for inference and ensemble, regardless of whether an earlier epoch was better. Across DINOv2-Large and SigLIP2 we consistently observe 1–3% accuracy left on the table when the model peaks before the final epoch.
+
+**Fix:** `EpochAccuracyCallback` in `utils.py` now tracks `_best_val_acc` and `_best_state` (CPU copy of best state dict) across epochs. On `on_train_end`, if the final epoch is not the best, the best weights are restored in-memory. No disk writes, no double eval, no change to `eval_strategy`.
+
+The epoch log now marks new bests with `✓best`. This fix is applied to all future runs (search.py and pipeline.py). Expected gain: +1–2% for SigLIP2 at 10–15ep.
+
+#### 5.5.26 SigLIP2-SO400M unfreeze depth and epoch sweep (configs 103–107, local RTX 5070 Ti)
+
+Five configs exploring unfreeze depth (2–8 blocks of 27), epochs (15–20), and LR (1e-4 vs 5e-5) with LLRD=0.8 or 0.75. All use best-epoch recovery.
+
+| config | unfreeze | lr | LLRD | epochs | acc | acc_std | f1 |
+|--------|----------|----|------|--------|-----|---------|-----|
+| 103 | 4 | 1e-4 | 0.8 | 15 | 0.9481 | 0.0080 | 0.9358 |
+| **104** | **2** | **1e-4** | **0.8** | **20** | **0.9500** | **0.0169** | **0.9396** |
+| 105 | 6 | 1e-4 | 0.8 | 20 | 0.9435 | 0.0107 | 0.9315 |
+| 106 | 8 | 1e-4 | 0.75 | 15 | 0.9444 | 0.0077 | 0.9330 |
+| 107 | 6 | 5e-5 | 0.8 | 15 | 0.9444 | 0.0192 | 0.9325 |
+
+**Key takeaways:**
+- **Best config: 104 (unfreeze=2, 20ep) at 95.00%.** The shallowest unfreeze wins again — the same pattern as DINOv2 (unfreeze=2 optimal). SigLIP2's pretrained representations are highly transferable; adapting only the top 2 layers is sufficient.
+- **Deeper unfreeze consistently hurts:** unfreeze=4 → 94.81%, unfreeze=6 → 94.35%/94.44%, unfreeze=8 → 94.44%. The range is compressed (94.35–95.00%), suggesting that at this dataset scale, unfreeze depth matters less than for DINOv2, but the shallow setting still wins.
+- **Longer epochs help:** config 103 (unfreeze=4, 15ep) vs config 104 (unfreeze=2, 20ep) — the 20ep run gains from both factors simultaneously. Config 105 (unfreeze=6, 20ep) scores 94.35%, showing that 20ep alone cannot compensate for over-unfreezing.
+- **LLRD=0.75 (config 106) offers no advantage** over LLRD=0.8 and introduces higher variance risk with 8 exposed layers. LLRD=0.8 is the right setting for SigLIP2.
+- **Lower LR (5e-5, config 107) matches 1e-4 in mean (94.44%) but triples the variance** (±0.0192 vs ±0.0077). 1e-4 with LLRD=0.8 is more stable.
+- **Stability vs. mean trade-off:** config 106 has the tightest std (±0.0077) but lower mean. Config 104 has the highest mean but also the highest std (±0.0169 — one fold hit 97.22%, one hit 92.13%). For a final submission, config 104's settings (unfreeze=2, 20ep, LLRD=0.8) are used.
+- **`models/__init__.py` updated:** siglip2_so400m → unfreeze=2, num_epochs=20, llrd_factor=0.8.
+
+#### 5.5.27 Multi-model ensemble + pseudo-labeling (overnight pipeline: DINOv2-Base + DINOv2-Large + SigLIP2-SO400M)
+
+Full pipeline run combining all three best-config models with class-routed ensemble and pseudo-label round 2.
+
+**Round 1 — 5-fold CV:**
+
+| Model | Val Acc | Std | F1 | Train time |
+|---|---|---|---|---|
+| DINOv2-Base | 0.8499 | ±0.0191 | 0.8287 | 6.9 min |
+| DINOv2-Large | 0.8758 | ±0.0268 | 0.8553 | 55.3 min |
+| SigLIP2-SO400M | **0.9481** | ±0.0122 | 0.9399 | 59.0 min |
+| Class-routed ensemble | 0.9370 | ±0.0086 | 0.9267 | — |
+
+**Round 2 — pseudo-labeling (threshold=0.97, blended ensemble source):**
+
+| Model | R1 acc | R2 acc | Delta |
+|---|---|---|---|
+| DINOv2-Base | 0.8499 | 0.8471 | −0.28% |
+| DINOv2-Large | 0.8758 | 0.8786 | +0.28% |
+| SigLIP2-SO400M | 0.9481 | 0.9481 | **0.00%** |
+
+**Key finding 1 — blended pseudo-labels are useless for SigLIP2:**
+Using an average of all three model groups (DINOv2 ×5 + DINOv2-Large ×5 + SigLIP2 ×5) to generate pseudo-labels produced zero improvement for SigLIP2 and −0.28% for DINOv2. Root cause: DINOv2's weaker predictions (85%) dilute SigLIP2's confident softmax scores, causing fewer test images to pass the 0.97 threshold and injecting label noise into round 2 training.
+
+**Key finding 2 — class-routed ensemble hurts when mixing models of very different strength:**
+The routed ensemble (93.70%) is **−1.11% below SigLIP2 alone (94.81%)**. Class routing distributes weight by per-class validation F1, which means DINOv2 "wins" on the 36 easy classes where all models score F1=1.0 — adding its predictions to SigLIP2's on those classes creates noise without benefit. The ensemble only genuinely outperforms all individuals on 9/100 classes.
+
+**Class leadership breakdown:**
+- SigLIP2 leads: **45/100** classes (all hard classes, most medium)
+- DINOv2 leads: 36/100 (mostly easy, F1=1.0 for all models — ties counted)
+- DINOv2-Large leads: 10/100
+- Routed ensemble outperforms all: 9/100 (classes 88, 64, 87, 61, 62, 54, 85, 74, 84)
+- Classes with spread >0.10 where routing helps most: 63 only had 9/100
+
+**Fix applied for next run (`pipeline.py`):** Pseudo-labels are now generated exclusively from the highest R1 accuracy model (auto-selected via `max(results, key=acc)`), which is SigLIP2. DINOv2 and DINOv2-Large receive SigLIP2-quality pseudo-labels — true knowledge distillation. SigLIP2 gets self-distillation from its own highest-confidence predictions only.
+
+**Fix applied for next run (`config.py`):** `USE_UPSAMPLE_BALANCE=True` — rare classes augmented to minimum 20 images per training fold.
+
+**Submission files from this run:**
+- `submission_siglip2_so400m.csv` — SigLIP2 R1 (best CV: 94.81%)
+- `submission_pseudo_siglip2_so400m.csv` — SigLIP2 R2 (same: 94.81%)
+- `submission_routed.csv` — class-routed R1 ensemble (93.70% CV — do NOT submit)
+
+#### 5.5.28 SigLIP2-SO400M solo with self-distillation pseudo-labeling (run_004c)
+
+SigLIP2 trained solo (no DINOv2 mixing) to test whether self-distillation pseudo-labels outperform blended ensemble pseudo-labels. Key change from 5.5.27: pseudo-labels generated exclusively from SigLIP2's own highest-confidence predictions rather than an ensemble average.
+
+| Round | Val Acc | Notes |
+|---|---|---|
+| R1 | 0.9518 | SigLIP2 solo (unfreeze=2, 20ep) |
+| **R2** | **0.9527** | **+0.09% from self-distillation** |
+
+**Kaggle: 95.454%** (5th place, tied with 3rd and 4th).
+
+Self-distillation works where blended ensemble pseudo-labels failed (zero gain in 5.5.27). The mechanism: DINOv2's weaker predictions previously diluted SigLIP2's softmax scores below the 0.97 confidence threshold. With SigLIP2 generating its own pseudo-labels, more test images pass the threshold and the injected signal is high-quality. The +0.09% CV gain understates the test benefit (95.454% vs prior 94.81% baseline on Kaggle = +0.644% test improvement).
+
+#### 5.5.29 Hard class routing + upsample balance (run_005a — DINOv2-Large + SigLIP2)
+
+Testing whether hard class routing with log-prob z-score normalisation improves over SigLIP2 solo when both models use `USE_UPSAMPLE_BALANCE=True` (min 20 images per class per training fold via upsampling). R2 pseudo-labeling included but crashed (SigLIP2 R2 fold 4 OOM — same location as run_004).
+
+**R1 results (5-fold CV):**
+
+| Model | Val Acc | Notes |
+|---|---|---|
+| DINOv2-Large | 0.8971 | New pipeline best; +2.32 pts over search cfg 80 (87.39%) due to upsample balance |
+| SigLIP2-SO400M | 0.9518 | Consistent with run_004c R1 |
+| **Hard routing** | **0.9509** | **−0.09% vs SigLIP2 solo** |
+
+**R2 crash:** SigLIP2 R2 fold 4 OOM — cumulative RAM pressure from the larger pseudo-label dataset (1997 vs 1079 images) by the 4th fold. Fold models freed; no R2 submission from this run.
+
+Key findings:
+- **Upsample balance helps DINOv2-Large significantly** (87.39% → 89.71%, +2.32 pts). More balanced per-class training improves coverage for rare classes. Effect likely to help SigLIP2 less due to its higher starting accuracy.
+- **Hard routing is essentially neutral** (−0.09% vs SigLIP2 solo). With only 2 models and SigLIP2 strongly dominant, routing cannot improve the mean. The 9 hard classes routed to DINOv2-Large may improve on the actual test set (unverifiable from CV).
+- **SigLIP2 solo remains the best CV strategy.** run_004c's R2 submission (95.454% Kaggle) is the current best.
+
+#### 5.5.30 SigLIP2-SO400M-512 solo validation (run_005)
+
+Testing the 512px resolution variant (`google/siglip2-so400m-patch16-512`) with competitor-inspired settings (unfreeze=6, 15ep, cosine, batch=8). Note: these were suboptimal hyperparameters — unfreeze=6 is already known to hurt 384px SigLIP2 by −0.65%.
+
+| Config | Resolution | Unfreeze | Epochs | Val Acc | Δ vs 384px best (cfg 104) |
+|---|---|---|---|---|---|
+| 104 (ref) | 384px | 2 | 20 | 0.9500 | — |
+| run_005 | **512px** | 6 | 15 | 0.9453 | **−0.47%** |
+
+Higher resolution is worse at these settings. Part of the regression is attributable to suboptimal hyperparameters (unfreeze=6 vs optimal unfreeze=2). Config 112 (512px, unfreeze=2, 20ep) confirmed this in run_008: **94.72%** — an improvement over suboptimal settings (+0.19%) but still −0.55% below the 384px best (95.27%). See section 5.5.32 for the full 512px search.
+
+#### 5.5.31 DINOv3 ViT-L/16 — model added, search staged (configs 113–119)
+
+DINOv3 (`facebook/dinov3-vitl16-pretrain-lvd1689m`) integrated as a new backbone. Model is access-gated on HuggingFace — `.env` HF_TOKEN authentication loader added to both `pipeline.py` and `search.py`.
+
+**Architecture:**
+- 300M parameters (same as DINOv2-Large, ViT-L/16)
+- Pretrained on LVD-1689M (1.689B images — 12× DINOv2-Large's 142M dataset)
+- Distilled from a ViT-7B teacher; no classification head (pretrain-only checkpoint)
+- Layer naming: `model.layer.{i}.` (vs DINOv2's `encoder.layer.{i}.`); `utils.py` patched accordingly
+- Uses `AutoModel` with linear head on `pooler_output`
+- Validated: 24 transformer layers detected; 25.3M/303.2M trainable params at unfreeze=2
+
+**Results (configs 113–119, all complete):**
+
+| Config | Unfreeze | LR | Epochs | Acc | Std | F1 |
+|---|---|---|---|---|---|---|
+| 113 | 2 | 1e-4 | 20 | 0.9221 | 0.0130 | 0.9134 |
+| 114 | 2 | 5e-5 | 20 | 0.8888 | 0.0206 | 0.8734 |
+| 115 | 4 | 1e-4 | 20 | 0.9259 | 0.0066 | 0.9149 |
+| 116 | 6 | 1e-4 | 20 | 0.9286 | 0.0081 | 0.9201 |
+| 117 | 2 | 1e-4 | 50 | 0.9360 | 0.0119 | 0.9277 |
+| **118** | **4** | **1e-4** | **50** | **0.9379** | **0.0119** | **0.9303** |
+| 119 | 4 | 5e-5 | 50 | 0.9333 | 0.0109 | 0.9259 |
+
+**Best config: 118 (unfreeze=4, lr=1e-4, 50ep) → 93.79%**
+
+**Key findings:**
+- **DINOv3 tolerates deeper unfreezing better than any prior model.** At 20ep, accuracy increases monotonically with unfreeze depth: unfreeze=2 → 92.21%, unfreeze=4 → 92.59%, unfreeze=6 → 92.86%. SigLIP2 peaked at unfreeze=2 and degraded with depth; DINOv2-Large also peaked at unfreeze=2. DINOv3's richer pretraining (1.689B images, ViT-7B distillation) makes the weights more resilient to gradient updates across more layers.
+- **50ep adds +1.4–1.6% over 20ep**, consistent with DINOv2-Large's non-monotonic epoch trend. Config 117 (unfreeze=2, 50ep): +1.39% over cfg 113 (unfreeze=2, 20ep).
+- **lr=5e-5 is harmful at 20ep (−3.3%)** but mostly recovers at 50ep (−0.46% vs lr=1e-4). More epochs compensate for the slower convergence.
+- **DINOv3 best (93.79%) < SigLIP2 best (95.27%) by 1.48 pts.** DINOv3 is a strong pure-vision backbone but cannot close the gap to SigLIP2's image-text pretraining on this 100-class task.
+- **Pipeline value:** DINOv3 at 93.79% offers complementarity to SigLIP2 (both ViT-L architecture, different pretraining). Hard routing with DINOv3 as the secondary model could improve on the 9 hard classes where DINOv2-Large currently leads.
+
+#### 5.5.32 SigLIP2-SO400M-512 hyperparameter search (run_008, configs 110–112)
+
+Systematic search over unfreeze depth and epoch count for the 512px variant, all with cosine scheduler, batch=8, lr=1e-4, LLRD=0.8.
+
+| Config | Unfreeze | Epochs | Acc | Std | F1 |
+|---|---|---|---|---|---|
+| 110 | 6 | 20 | 0.9407 | 0.0106 | 0.9295 |
+| 111 | 6 | 30 | 0.9370 | 0.0112 | 0.9237 |
+| **112** | **2** | **20** | **0.9472** | **0.0139** | **0.9352** |
+
+**Best config: 112 (unfreeze=2, 20ep) → 94.72%**
+
+**Key findings:**
+- **unfreeze=2 is optimal at 512px**, identical to the 384px finding. Deeper unfreezing (unfreeze=6, cfg 110) loses −0.65%. The larger token grid (1024 vs 576 patches) does not require additional backbone adaptation — shallow fine-tuning of the top 2 layers is sufficient.
+- **Longer training at unfreeze=6 regresses.** Config 111 (30ep, unfreeze=6) = 93.70%, −0.37% vs cfg 110 (20ep, unfreeze=6). More epochs amplify overfitting when the backbone is over-unfrozen at higher resolution.
+- **512px best (94.72%) < 384px best (95.27%) by −0.55%.** Native resolution is confirmed optimal for SigLIP2. The positional embedding interpolation from 384px pretraining to 512px inference degrades patch-level alignment, and ~1079 training images cannot compensate.
+- **Ensemble potential:** Despite the regression, 94.72% at 512px is a viable second model for a soft-weighted ensemble with the 384px SigLIP2 (competitor achieved 97% from a similar 96.4%+95.4% pairing). Error patterns differ by resolution — the ensemble may recover some of the 5.3% test errors that neither resolution alone handles.
+
+---
 
 ### 5.6 Overall Best Results Summary
 
-| Model | Best acc | Config | Key settings |
-|---|---|---|---|
-| ResNet-50 | 6.79% | baseline | — |
-| ResNet-101 | 14.81% | baseline | — |
-| ConvNeXt-Base | 76.27% | 11 | unfreeze=4, lr=3e-4 |
-| ConvNeXt-Large | 77.85% | pipeline | unfreeze=4, prog-unfreeze |
-| ViT-B/16 | 74.42% | 54 | unfreeze=4, LLRD=0.85, +CJ |
-| DINOv2-Base | 85.54% | 64 | unfreeze=2, lr=1e-4, LLRD=0.85, 10ep |
-| **DINOv2-Large** | **86.84%** | **72** | **unfreeze=2, lr=1e-4, LLRD=0.75, 30ep** |
+| Model | Best CV acc | Kaggle | Config | Key settings |
+|---|---|---|---|---|
+| ResNet-50 | 6.79% | — | baseline | — |
+| ResNet-101 | 14.81% | — | baseline | — |
+| ConvNeXt-Base | 76.27% | — | 11 | unfreeze=4, lr=3e-4 |
+| ConvNeXt-Large | 77.85% | — | pipeline | unfreeze=4, prog-unfreeze |
+| ViT-B/16 | 74.42% | — | 54 | unfreeze=4, LLRD=0.85, +CJ |
+| SigLIP-Base | 84.61% | — | 90 | unfreeze=2, lr=1e-4, 20ep |
+| CLIP-ViT-Large/14 | _TODO_ | — | 91–93 | bug fixed, rerun pending |
+| DINOv2-Base | 85.54% | — | 64 | unfreeze=2, lr=1e-4, LLRD=0.85, 10ep |
+| DINOv2-Large (search) | 87.39% | — | 80 | unfreeze=2, lr=1e-4, LLRD=0.75, 50ep |
+| DINOv2-Large (pipeline, upsample) | 89.71% | — | run_005a | unfreeze=2, 50ep, upsample min=20 |
+| DINOv3 ViT-L/16 | 93.79% | — | 118 | unfreeze=4, lr=1e-4, 50ep |
+| SigLIP2-SO400M-512 (run_005) | 94.53% | — | run_005 | unfreeze=6, 15ep (suboptimal) |
+| SigLIP2-SO400M-512 (cfg 112) | 94.72% | — | 112 | unfreeze=2, lr=1e-4, 20ep (optimal 512px) |
+| SigLIP2-SO400M-384 (cfg 104) | 95.00% | — | 104 | unfreeze=2, lr=1e-4, LLRD=0.8, 20ep |
+| SigLIP2-SO400M-384 R1 (run_004c) | 95.18% | — | run_004c | pipeline, unfreeze=2, 20ep |
+| Hard routing (run_005a R1) | 95.09% | — | run_005a | DINOv2-Large + SigLIP2, log-prob z-score |
+| **SigLIP2-SO400M-384 R2** | **95.27%** | **95.454%** | **run_004c** | **self-distillation pseudo-label, 5th place** |
 
 ### 5.7 Pipeline Run — Class-Routed Ensemble (DINOv2-Base + DINOv2-Large)
 
@@ -431,25 +683,28 @@ The routed ensemble (+0.37% over Large alone) confirms that Base and Large are c
 - `submission_dinov2_large.csv` — DINOv2-Large single-model predictions
 - `submission_routed.csv` — Class-routed ensemble (best submission)
 
-2. **Kaggle public leaderboard score.** _TODO_
+2. **Kaggle public leaderboard score.** Best submission: **95.454%** (5th place, tied with 3rd–4th). Source: SigLIP2-SO400M-384 R2 self-distillation pseudo-label run (run_004c).
 3. **Qualitative error analysis.** _TODO_
 
 ---
 
 ## 6 Discussion
 
-1. **What worked best and why.** DINOv2-Large with 2 unfrozen top encoder blocks, lr=1e-4, LLRD=0.75, and 30 epochs achieved **86.84%** — the best result across all 78 configs. DINOv2-Base peaked at **85.54%** (unfreeze=2, lr=1e-4, LLRD=0.85, 10ep). Both significantly exceed CNN and ViT baselines: ConvNeXt-Large 77.85%, ViT-B/16 74.42%. The pattern is consistent: DINOv2's self-supervised DINO pretraining yields features so transferable that only the top two encoder layers need adapting (unfreeze=4 loses −1.7 pts; unfreeze=6 loses −4.1 pts). Higher LR (1e-4) with LLRD outperforms the standalone optimal (5e-5 no LLRD) because LLRD lets the head and top layers update aggressively while shielding the pretrained lower representations. DINOv2-Large absorbs 30 epochs without overfitting due to its larger capacity; DINOv2-Base peaks at 10ep and regresses beyond that.
+1. **What worked best and why.** SigLIP2-SO400M-384 with 2 unfrozen layers, lr=1e-4, LLRD=0.8, 20 epochs, and self-distillation pseudo-labeling achieved **95.27% CV** and **95.454% Kaggle** — the final result across all 119 configs and pipeline runs. The dominant factor is pretraining quality: SigLIP2's 400M-param ViT-So400M backbone, pretrained on billions of image-text pairs at native 384px resolution, transfers to 100-class classification with minimal fine-tuning (only the top 2 of 27 layers need adapting). The pattern mirrors DINOv2: shallow unfreeze (2 blocks) consistently outperforms deeper unfreezing (unfreeze=6 loses −0.65%), and shorter training can overfit (20ep optimal, not longer). Self-distillation pseudo-labeling adds +0.09% CV (and +0.64% Kaggle test), while blended ensemble pseudo-labels produce zero gain — the stronger model must generate its own labels to avoid noise injection from weaker ensembles. DINOv2-Large at 50ep (87.39% search) remains the best DINOv2 result, but the 7.9 point gap to SigLIP2 confirms that architecture and pretraining dataset dominate hyperparameter tuning at this scale.
 
 2. **Failure cases, overfitting/underfitting observations.** Class 66 scores F1=0 across all models — consistently the hardest class. DINOv2-base overfits past 10 epochs: 20ep → 0.8526 < 0.8554, 30ep → 0.8406 (using best config 64 params). DINOv2-Large does not show this: 30ep → 0.8684 > 20ep → 0.8564. ViT-B/16's steep LR sensitivity (2% frozen at 1e-5, 45% at 1e-4) reflects the CLS token struggling to adapt without backbone gradient flow; partial unfreezing with LLRD resolves it (+27 pts). The layer-count bug in `apply_freeze` (hardcoded 12 layers) made configs 57–58 invalid — DINOv2-Large has 24 layers, so unfreeze=2 was actually unfreezing layers 10–11 instead of 22–23.
 
 3. **Limitations and next steps.**
-   - **Class-routed ensemble implemented and evaluated:** Running both DINOv2-Base and DINOv2-Large through the full pipeline with class-routing yields 86.84% — a +0.37% gain over Large alone. Base dominates 51/100 classes despite lower overall accuracy, confirming complementarity. `submission_routed.csv` is the current best submission.
-   - **518px native resolution untested:** DINOv2 was pretrained at 518px (patch_size=14 → 37×37 patches). The pipeline currently downsamples to 224px (16×16 patches), discarding spatial detail. Config 85 (518px, batch=16) is queued to measure the impact.
-   - **RandAugment on DINOv2-Large untested:** Config 86 (RandAugment, 224px) will isolate the augmentation effect on Large specifically.
-   - **Label-mixing collators ineffective at this scale:** Mixup (−2%), CutMix (−6%), MixupCutMix (−6%) all hurt at ~10 images/class. Disabled in the final pipeline.
-   - **Augmentation is neutral-to-harmful for DINOv2:** RandAugment and the full aug stack consistently degrade both Base and Large. Only ViT benefits from ColorJitter.
-   - **Small dataset ceiling:** With ~10 images per class, further gains likely require semi-supervised pseudo-labeling on the test set or external data augmentation from similar public datasets.
-   - **Kaggle submissions available per config:** `search_results/config_{i}_{model}.csv` provides a Kaggle-submittable prediction file for every completed config.
+   - **SigLIP2-SO400M-384 is the dominant backbone.** At 95.00% (search config 104) and 95.27% CV / 95.454% Kaggle (run_004c with pseudo-labels), it outperforms DINOv2-Large by 7.9 points. The gap reflects fundamentally better pretraining (image-text pairs at native 384px resolution vs self-supervised on ImageNet).
+   - **Self-distillation pseudo-labeling works; blended ensemble pseudo-labels do not.** +0.09% CV, +0.64% Kaggle test when SigLIP2 generates its own pseudo-labels. Zero gain when diluted by DINOv2 predictions (5.5.27).
+   - **Hard class routing with log-prob z-score normalisation is neutral at −0.09% CV** (5.5.29). With a dominant model (SigLIP2 at 95%) and one much weaker model (DINOv2-Large at 90%), routing cannot improve the mean — the weaker model "wins" only easy classes where both models already score F1=1.0. Routing may add test-set value on the 9 hard classes where DINOv2-Large leads by per-class val F1, but this is unverifiable from CV alone.
+   - **Higher resolution consistently hurts.** SigLIP2-512: −0.47% at suboptimal settings (run_005), −0.55% even at optimal settings (cfg 112, unfreeze=2, 94.72%). DINOv2-518: −9.64% (configs 85–87). Token sequence expansion exceeds what ~1079 training images can support; positional embedding interpolation noise from 384px pretraining dominates. Native resolution is confirmed optimal across all tested models.
+   - **Class weights ruled out.** Inverse-frequency weighting hurts all models (SigLIP-Base −0.75%, DINOv2-Large −2.13%). Distorts gradient balance more than it helps rare classes at this scale.
+   - **Upsample balance (`USE_UPSAMPLE_BALANCE=True`, min=20)** helps DINOv2-Large significantly (+2.32 pts, 87.39% → 89.71%). Effect on SigLIP2 not yet isolated.
+   - **DINOv3 best: 93.79% (cfg 118, unfreeze=4, 50ep).** Strong but 1.48 pts below SigLIP2. Its complementary pretraining (self-supervised patch distillation vs SigLIP2's image-text contrastive) makes it a candidate for soft-weighted ensemble; a weight grid search over SigLIP2-384 + DINOv3 is the logical next step.
+   - **CLIP-ViT-Large/14 deprioritised.** Bug fixed (missing `.config`), but SigLIP2's 95% makes CLIP-ViT results less strategically relevant with 3 days remaining.
+   - **Label-mixing and spatial augmentation ineffective.** Mixup (−2%), CutMix (−6%), RandAugment neutral-to-negative across all tested models. Disabled in the final pipeline.
+   - **Kaggle submissions per config** available at `search_results/config_{i}_{model}.csv`.
 
 ---
 

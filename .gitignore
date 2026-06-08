@@ -8,3 +8,4 @@ search_results/
 *.csv
 pipeline_results.txt
 *.log
+.env

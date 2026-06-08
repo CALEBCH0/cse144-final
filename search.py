@@ -1,6 +1,19 @@
 import csv
 import os
 import time
+from collections import Counter
+
+# Load .env for HF_TOKEN (needed for gated models like DINOv3)
+_env = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env):
+    with open(_env) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -50,7 +63,13 @@ CONFIGS_TO_RUN = {
     # More epochs + LLRD sweep + cosine + deeper unfreeze for Large; base cosine
     # 78, 79, 80, 81, 82, 83, 84,  # done / currently running
     # 518px resolution + RandAugment combos
-    85, 86, 87,
+    # 85, 86, 87,  # currently running
+    # CLIP-ViT rerun (91-93 failed due to .config bug, now fixed)
+    # 91, 92, 93,
+    # DINOv3 ViT-L: fastest→slowest (20ep: 113-116, 50ep: 117-119)
+    # 113, 114, 115, 116, 117, 118, 119,  # done
+    # SigLIP2-SO400M-512 resolution search
+    110, 111, 112,
 }
 
 # fmt: off
@@ -259,6 +278,130 @@ SEARCH_CONFIGS = [
     # 87: 518px + RandAugment — combined; only run after 85/86 confirm both are individually positive
     {"model": "dinov2_large_518", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
      "llrd_factor": 0.75, "num_epochs": 30, "use_randaugment": True, "batch_size": 16},
+
+    # ── SigLIP baselines ───────────────────────────────────────────────────  idx 88-90
+    # 88: SigLIP baseline — same conservative settings as best DINOv2-base config
+    {"model": "siglip", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    # 89: + class weights — SigLIP has 768-dim features; minority classes may benefit most
+    {"model": "siglip", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "use_class_weights": True},
+    # 90: more epochs — SigLIP pretrained on broader data; may need more fine-tuning time
+    {"model": "siglip", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "num_epochs": 20},
+
+    # ── CLIP-ViT-Large baselines ───────────────────────────────────────────  idx 91-93
+    # 91: CLIP-ViT-Large/14 baseline — 24-layer ViT, stronger than DINOv2-base
+    {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
+    # 92: + class weights
+    {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "use_class_weights": True},
+    # 93: more epochs
+    {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "num_epochs": 20},
+
+    # ── DINOv2-Large best config + class weights ───────────────────────────  idx 94-95
+    # 94: cfg-80 best (50ep, LLRD=0.75) + class weights — does balancing help large model?
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50, "use_class_weights": True},
+    # 95: cfg-80 best + class weights + RandAugment — combined accessories
+    {"model": "dinov2_large", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50, "use_class_weights": True, "use_randaugment": True},
+
+    # ── SigLIP2-SO400M-384 (top-team backbone) ────────────────────────────  idx 96-102
+    # Top team: frozen probe on this backbone alone → 94.5% OOF; fine-tuned → 95.4%
+    # SO400M = 400M-param ViT-So400M, 27 transformer layers, pretrained at 384px on image-text pairs
+
+    # 96: conservative baseline — 2 blocks, same settings as DINOv2 best
+    {"model": "siglip2_so400m", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8},
+    # 97: their unfreeze depth — 6/27 blocks; batch_size=16 (unfreeze=6 OOMs at 32 on T4/local)
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "batch_size": 16},
+    # 98: their exact scheduler + epoch combo — cosine 15ep; batch_size=16
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "batch_size": 16},
+    # 99: + MixUp — top team used MixUp/CutMix successfully on SigLIP2; isolate MixUp effect
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "collator": "mixup", "batch_size": 16},
+    # 100: + CutMix — isolate CutMix effect
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "collator": "cutmix", "batch_size": 16},
+    # 101: + class weights — does balancing help SO400M tail classes?
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "use_class_weights": True, "batch_size": 16},
+    # 102: SO400M-512px — larger spatial resolution; batch_size=8 for VRAM
+    {"model": "siglip2_so400m_512", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "batch_size": 8},
+
+    # ── SigLIP2-SO400M hyperparameter sweep (local) ─────────────────────  idx 103-107
+    # Kaggle covers: 96 (unfreeze=2,10ep), 97 (unfreeze=6,10ep), 98 (unfreeze=6,15ep,cosine)
+    # Local fills: depth=4, depth=8, 20ep variants, conservative lr
+
+    # 103: unfreeze=4 — intermediate depth between Kaggle's 2 and 6
+    {"model": "siglip2_so400m", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15},
+    # 104: unfreeze=2, 20ep — baseline + more epochs; fold 1/3 still improving at ep10 in cfg 96
+    {"model": "siglip2_so400m", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 20},
+    # 105: unfreeze=6, 20ep — extend Kaggle cfg 97 to 20ep; batch_size=16 for unfreeze≥6
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 20, "batch_size": 16},
+    # 106: unfreeze=8, LLRD=0.75 — deeper unfreeze; batch_size=16
+    {"model": "siglip2_so400m", "unfreeze_blocks": 8, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 15, "batch_size": 16},
+    # 107: unfreeze=6, lr=5e-5 — conservative LR at top-team depth; batch_size=16
+    {"model": "siglip2_so400m", "unfreeze_blocks": 6, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 15, "batch_size": 16},
+
+    # ── SigLIP2 longer training sweep ──────────────────────────────────────  idx 108-111
+    # cfg 104 (best): unfreeze=2, 20ep → 95.00%. Does training longer help?
+    # 108: unfreeze=2, 30ep — +10ep beyond current best
+    {"model": "siglip2_so400m", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 30},
+    # 109: unfreeze=2, 40ep — +20ep; test for overfitting vs further gain
+    {"model": "siglip2_so400m", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 40},
+    # 110: siglip2_so400m_512, 20ep — baseline 512px used 15ep; try +5ep
+    {"model": "siglip2_so400m_512", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 20, "batch_size": 8},
+    # 111: siglip2_so400m_512, 30ep — longer training for 512px
+    {"model": "siglip2_so400m_512", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 30, "batch_size": 8},
+    # 112: siglip2_so400m_512, unfreeze=2 — fix: we used unfreeze=6 (competitor-inspired) but
+    #      unfreeze=2 is best for 384px; test if it rescues 512px from bad config
+    {"model": "siglip2_so400m_512", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "cosine", "label_smoothing": 0.1, "weight_decay": 0.01,
+     "llrd_factor": 0.8, "num_epochs": 20, "batch_size": 8},
+
+    # ── DINOv3 ViT-L/16 (facebook/dinov3-vitl16-pretrain-lvd1689m) ─────────  idx 113-118
+    # ViT-L, 300M params, pretrained on 1.689B images (12× DINOv2-Large's 142M).
+    # Distilled from ViT-7B teacher. Same size as DINOv2-Large → similar training time.
+    # DINOv2-Large best: unfreeze=2, lr=1e-4, linear, 50ep, llrd=0.75 → 87.39%.
+    # Ordered fastest → slowest (20ep before 30ep, smaller unfreeze first).
+    # Key questions: (1) does stronger pretraining allow more unfreezing?
+    #                (2) does it converge faster (fewer epochs needed)?
+    #                (3) lower lr to preserve richer features?
+
+    # 113: baseline — same as dinov2_large best but 20ep; establishes DINOv3 floor (~95min)
+    {"model": "dinov3", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 20},
+    # 114: lower LR — gentler updates to preserve richer DINOv3 features (~95min)
+    {"model": "dinov3", "unfreeze_blocks": 2, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 20},
+    # 115: unfreeze=4, 20ep — does stronger pretraining tolerate deeper fine-tuning? (~97min)
+    {"model": "dinov3", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 20},
+    # 116: unfreeze=6, 20ep — deep fine-tuning; risky on 1079 images but worth one test (~100min)
+    {"model": "dinov3", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 20},
+    # 117: unfreeze=2, 50ep — full training at conservative depth (matches dinov2_large best) (~46min)
+    {"model": "dinov3", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50},
+    # 118: unfreeze=4, 50ep — deeper unfreeze at full training budget (~46min)
+    {"model": "dinov3", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50},
+    # 119: unfreeze=4, lr=5e-5, 50ep — lower LR cross with deeper unfreeze + full epochs (~46min)
+    {"model": "dinov3", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50},
 ]
 # fmt: on
 
@@ -275,6 +418,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         use_random_erasing=cfg.get("use_random_erasing", False),
     )
     all_label_ids = list(range(num_labels))
+    fold_per_class_f1 = []
 
     # Collator selection
     collator_type = cfg.get("collator", "none")
@@ -316,7 +460,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
             weight_decay=cfg["weight_decay"],
             label_smoothing_factor=cfg["label_smoothing"],
             lr_scheduler_type=cfg["scheduler"],
-            warmup_ratio=0.1 if cfg["scheduler"] == "cosine" else 0.0,
+            warmup_steps=int(0.1 * cfg.get("num_epochs", NUM_EPOCHS) * (863 // fold_batch_size)) if cfg["scheduler"] == "cosine" else 0,
             eval_strategy="no",
             save_strategy="no",
             load_best_model_at_end=False,
@@ -331,6 +475,15 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         # LLRD disabled when LoRA active (PEFT renames params, breaking layer pattern matching)
         llrd_factor = cfg.get("llrd_factor", 1.0) if lora_r == 0 else 1.0
         use_soft_labels = collator_type in ("mixup", "cutmix", "mixup_cutmix")
+
+        class_weights = None
+        if cfg.get("use_class_weights", False):
+            counts = Counter(full_dataset["label"])
+            cw = torch.zeros(num_labels)
+            for ci in range(num_labels):
+                cw[ci] = 1.0 / max(counts.get(ci, 1), 1)
+            class_weights = cw / cw.mean()
+
         trainer = CustomTrainer(
             model=model,
             args=training_args,
@@ -342,6 +495,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
             llrd_factor=llrd_factor,
             model_name=cfg["model"],
             use_mixup=use_soft_labels,
+            class_weights=class_weights,
         )
 
         train_eval_fold = full_dataset.select(train_idx).with_transform(val_tf)
@@ -371,11 +525,13 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         preds = np.argmax(preds_out.predictions, axis=1)
         true  = preds_out.label_ids
 
+        per_class = f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0)
+        fold_per_class_f1.append(per_class)
         fold_metrics.append({
             "accuracy":  accuracy_score(true, preds),
             "precision": precision_score(true, preds, average="macro", zero_division=0),
             "recall":    recall_score(true, preds, average="macro", zero_division=0),
-            "f1":        f1_score(true, preds, labels=all_label_ids, average="macro", zero_division=0),
+            "f1":        float(per_class.mean()),
         })
         fold_models.append(model.cpu())
         torch.cuda.empty_cache()
@@ -392,6 +548,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
 
     mean_train_sec = float(np.mean(fold_train_sec)) if fold_train_sec else 0.0
     mean_eval_sec  = float(np.mean(fold_eval_sec))  if fold_eval_sec  else 0.0
+    mean_per_class_f1 = np.mean(fold_per_class_f1, axis=0) if fold_per_class_f1 else np.zeros(num_labels)
 
     return (
         {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")},
@@ -399,6 +556,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         mean_train_sec,
         mean_eval_sec,
         fold_models,
+        mean_per_class_f1,
     )
 
 
@@ -456,6 +614,13 @@ def main():
                   "color_jitter", "randaugment", "random_erasing", "collator", "lora_r",
                   "acc_mean", "acc_std", "f1_mean", "f1_std", "prec_mean", "rec_mean",
                   "train_sec", "eval_sec"]
+    per_class_fieldnames = ["config", "model"] + [f"class_{i}_f1" for i in range(num_labels)]
+    per_class_file = os.path.join(os.path.dirname(RESULTS_FILE) or ".", "search_per_class.csv")
+    per_class_completed = set()
+    if os.path.exists(per_class_file):
+        with open(per_class_file, newline="") as _f:
+            for _row in csv.DictReader(_f):
+                per_class_completed.add(int(_row["config"]))
 
     # resume support — skip configs already written
     completed = set()
@@ -493,7 +658,7 @@ def main():
 
             model_cfg = model_lookup[cfg["model"]]
             try:
-                mean, std, mean_train_sec, mean_eval_sec, fold_models = run_cv(
+                mean, std, mean_train_sec, mean_eval_sec, fold_models, mean_per_class_f1 = run_cv(
                     cfg, model_cfg, full_dataset, fold_splits,
                     class_names, num_labels, label2id, id2label,
                     cfg_index=i,
@@ -506,6 +671,30 @@ def main():
 
             write_row(writer, cfg, mean, std, mean_train_sec, mean_eval_sec, i, total)
             f.flush()
+
+            # ── per-class F1 CSV ──────────────────────────────────────────────
+            if i not in per_class_completed:
+                pc_row = {"config": i, "model": cfg["model"]}
+                pc_row.update({f"class_{j}_f1": f"{v:.4f}" for j, v in enumerate(mean_per_class_f1)})
+                pc_exists = os.path.exists(per_class_file)
+                with open(per_class_file, "a", newline="") as pf:
+                    pc_writer = csv.DictWriter(pf, fieldnames=per_class_fieldnames)
+                    if not pc_exists:
+                        pc_writer.writeheader()
+                    pc_writer.writerow(pc_row)
+                per_class_completed.add(i)
+
+            # ── hard-class summary ────────────────────────────────────────────
+            HARD_THRESHOLD = 0.5
+            hard = [(j, class_names[j], mean_per_class_f1[j])
+                    for j in range(num_labels) if mean_per_class_f1[j] < HARD_THRESHOLD]
+            hard.sort(key=lambda x: x[2])
+            if hard:
+                print(f"  Hard classes (F1 < {HARD_THRESHOLD}): {len(hard)}")
+                for j, name, val in hard[:10]:
+                    print(f"    class {j:>3} ({name}): F1={val:.3f}")
+                if len(hard) > 10:
+                    print(f"    ... and {len(hard)-10} more")
 
             # ── generate Kaggle submission CSV ────────────────────────────
             data_root = os.path.dirname(TRAIN_DIR)

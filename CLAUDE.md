@@ -107,6 +107,8 @@ Skip fold-level signals (too noisy for phone).
 
 **Always report every signal to main chat** — fold_start, fold_done, config_start, config_done, model_start, model_done, pipeline_done. This keeps the user informed of progress without asking.
 
+**Always append a timestamp to every monitor update message** in the format `(MM/DD H:MMam/pm)`, e.g. `(06/08 4:44pm)`. Get the current time with `date '+%m/%d %-I:%M%P'` via Bash before writing the message. Do NOT embed timestamps in scripts or log output — only in the chat message text.
+
 ### PushNotification message formats
 - `config_done`: `"[search] cfg {config} {model} — acc={acc} f1={f1}"`
 - `model_done`: `"[pipeline] {model} done — acc={acc} f1={f1} ({total_min}m)"`
@@ -114,11 +116,33 @@ Skip fold-level signals (too noisy for phone).
 - `search_done`: `"[search] DONE — {total} configs, results in {results}"`
 - `pipeline_done`: `"[pipeline] DONE — best={best} acc={acc}"`
 
-## Post-run routine (search and pipeline)
-After every search or pipeline run completes (`search_done` or `pipeline_done` signal), always:
-1. Read the results file (`search_results.csv` for search, `pipeline_result.txt` for pipeline)
-2. Update `report.md` with the new results (add sections as needed, update summary tables)
-3. In the main chat, discuss implications and suggest next steps based on the results
+## End-of-run cleanup (do this on every search_done / pipeline_done)
+
+When a run completes, always do ALL of the following before starting the next run:
+
+### 1 — Stop stale monitors
+Call `TaskStop` on **both** the signal monitor and the watchdog for the finished run.
+- Task IDs are recorded in the RUNNING entry of `run_queue.md` (`Monitors: signal=X, watchdog=Y`).
+- Do NOT leave old monitors running — they watch stale log files and fire false ##DEAD## alerts.
+- Only the monitors for the *currently active* run should be alive at any time.
+
+### 2 — Update run_queue.md
+- Move entry from RUNNING → FINISHED (add Completed timestamp, Total time, results, key findings, next action).
+- Promote next STAGED entry to RUNNING (add PID + new monitor task IDs).
+- If nothing is launching next, set RUNNING to `_(none)_`.
+
+### 3 — Read results and update report.md
+- `search_results.csv` for search runs; `pipeline_result.txt` for pipeline runs.
+- Add new section(s) to report.md, update section 5.6 summary table, update section 6 discussion as needed.
+
+### 4 — Discuss and suggest next steps in main chat
+
+### Monitor task ID tracking
+Every RUNNING entry in run_queue.md must record:
+```
+- **Monitors**: signal=<task_id>, watchdog=<task_id>
+```
+These IDs are used at cleanup time to call TaskStop. Never start a new run without recording both IDs.
 
 ## Shorthand commands
 

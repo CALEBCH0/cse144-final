@@ -53,8 +53,8 @@ MODELS = [
         "output_dir": "checkpoints/dinov3",
         "learning_rate": 1e-4,
         "llrd_factor": 0.75,     # same as dinov2_large (same model size)
-        "num_epochs": 50,         # start same as dinov2_large; may tune later
-        "unfreeze_blocks": 2,     # conservative start; same as dinov2_large best
+        "num_epochs": 50,         # cfg 118 best: 50ep → 93.79%
+        "unfreeze_blocks": 4,     # cfg 118 best: unfreeze=4 (monotonically better than 2 for DINOv3)
     },
     {
         "name": "dinov2",
@@ -154,8 +154,8 @@ MODELS = [
         "output_dir": "checkpoints/siglip2_so400m_512",
         "learning_rate": 1e-4,
         "llrd_factor": 0.8,
-        "unfreeze_blocks": 6,
-        "num_epochs": 15,
+        "unfreeze_blocks": 2,   # cfg 112 best: unfreeze=2, 20ep → 94.72% (unfreeze=6 hurts same as 384px)
+        "num_epochs": 20,
         "batch_size": 8,        # 1024 tokens at 512px — needs smaller batch
     },
     {

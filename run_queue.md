@@ -7,7 +7,17 @@ Format: move entry from STAGED → RUNNING (add PID/monitors) → FINISHED (add 
 
 ## RUNNING
 
-_(none)_
+### run_012 — pipeline.py (SigLIP2 R1 solo — clean val_probs regeneration)
+- **Started**: 2026-06-09
+- **PID**: 1096185
+- **Monitors**: signal=brm68ob6t, watchdog=b00boyse4
+- **Script**: pipeline.py --export pipeline_result.txt --run-id run012
+- **Log**: pipeline_run.log
+- **Models**: siglip2_so400m (R1 only, USE_PSEUDO_LABEL=False)
+- **Goal**: Regenerate clean val_probs_siglip2_so400m.npy (1079, 100) — corrupted by R2 overwrite bug
+- **Config**: standard (unfreeze=2, lr=5e-5 via LEARNING_RATE, LLRD=0.75, 10ep, upsample min=20)
+- **ETA**: ~100 min
+- **Expected output**: probs/val_probs_siglip2_so400m.npy (1079, 100), submissions/run012_sig2_r1.csv
 
 ---
 
@@ -30,6 +40,72 @@ _(none)_
 ---
 
 ## FINISHED
+
+### run_011b — pipeline.py (SigLIP2 R2 with ensemble pseudo-labels)
+- **Started**: 2026-06-08
+- **Completed**: 2026-06-09
+- **Total time**: ~3h 37m (R1: 99.2min, pseudo-gen: ~4min, R2: 102.3min)
+- **Status**: SUCCESS
+- **Results**:
+  | Round | CV Acc | F1 |
+  |---|---|---|
+  | R1 | 95.00% | 0.9429 |
+  | **R2** | **95.09%** | **0.9429** |
+- **Pseudo-label source**: ensemble `0.35×siglip2_so400m + 0.65×dinov3` (probs from run_009/010)
+- **Submission**: submission_pseudo_siglip2_so400m.csv (R2, 95.09%)
+- **Key findings**:
+  - Ensemble pseudo-labels (+0.09% R2 gain) = identical to self-distillation (+0.09% in run_004c)
+  - Higher-quality pseudo-label source (95.00% ensemble vs 94.90% solo) does not improve R2 gain — limiting factor is the number of confident test images, not label quality
+  - Hard classes (F1 < 0.5): class 63 (0.43), class 86 (0.48), class 88 (0.45)
+  - R1 95.00% consistent across run_009, run_011, run_011b — SigLIP2 is very stable
+- **Crash note**: run_011 (SigLIP2+DINOv3 together) crashed at SigLIP2 fold 3 — Windows memory fragmented after DINOv3's 78min run. Solo run matches run_009 profile and completed cleanly.
+- **Next action**: Submit run_011b; consider CLIP-ViT run (run_006) for completeness
+
+### run_011 — pipeline.py (SigLIP2+DINOv3 R2 — CRASHED)
+- **Started**: 2026-06-08
+- **Status**: CRASHED — SigLIP2 fold 3 silent OOM after DINOv3's prior 78min run fragmented Windows memory
+- **Partial results**: DINOv3 R1 93.70% complete; SigLIP2 R1 folds 1-2 complete (92.13%, 96.76%); crash at fold 3 upsample
+- **Recovery**: run_011b (SigLIP2 solo) succeeded
+
+### run_010 — pipeline.py (DINOv3 probs + SigLIP2+DINOv3 ensemble grid search)
+- **Started**: 2026-06-08
+- **Completed**: 2026-06-08
+- **Total time**: ~3.8h
+- **Status**: SUCCESS
+- **Results**: DINOv3 CV acc=93.70%, F1=0.9349. probs/val_probs_dinov3.npy + probs/test_probs_dinov3.npy saved.
+- **Ensemble grid search** (SigLIP2-384 + DINOv3):
+  | w (DINOv3) | CV Acc |
+  |---|---|
+  | 0.00 (SigLIP2 solo) | 94.90% |
+  | **0.65** | **95.00%** |
+  | 1.00 (DINOv3 solo) | 93.70% |
+  - Best: `0.35*siglip2_so400m + 0.65*dinov3` → **95.00%** (+0.10% over SigLIP2 solo)
+- **Submission**: submission_ensemble_siglip2_so400m_dinov3_w0p65.csv (not yet submitted)
+- **Key findings**:
+  - Optimal w=0.65 leans heavily on DINOv3 despite it being the weaker model — complementary error patterns across pretraining objectives
+  - Gain modest (+0.10%) due to 1.20pt accuracy gap between models; independent errors not fully decorrelated
+  - Ensemble pseudo-labels (95.00%) are higher quality than SigLIP2 self-distillation alone (run_004c had 95.27% post-pseudo)
+- **Next action**: run_011 — R2 retrain both models with ensemble pseudo-labels
+
+### run_009 — pipeline.py (SigLIP2-384 + SigLIP2-512, probs + ensemble grid search)
+- **Started**: 2026-06-08
+- **Completed**: 2026-06-08
+- **Total time**: ~4h (incl. OOM crash + relaunch)
+- **Status**: SUCCESS (siglip2_so400m OK; siglip2_so400m_512 OOM on fold 2, relaunched as run_009b after fix)
+- **Results**:
+  | Model | CV Acc | F1 |
+  |---|---|---|
+  | siglip2_so400m | 94.90% | 0.9421 |
+  | siglip2_so400m_512 | 94.90% | 0.9398 |
+- **Ensemble grid search** (0.90×384 + 0.10×512): **95.09% CV** (+0.19% over solo)
+- **Submission**: submission_ensemble_siglip2_so400m_siglip2_so400m_512_w0p10.csv
+- **Key findings**:
+  - Both models identical at 94.90% CV — same backbone + upsample converges to same accuracy
+  - Ensemble gain only +0.19% — high error correlation expected from same architecture
+  - w=0.10 optimal (lean heavily on 384px); equal weighting (w=0.50) is −0.74%
+  - Bug fixed: fold models not freed between models → CPU RAM OOM. Fix: free when USE_CLASS_ROUTING=False
+  - probs/ directory now populated: val_probs and test_probs for both SigLIP2 variants
+- **Next action**: run_010 (DINOv3 probs) → ensemble_grid.py --a siglip2_so400m --b dinov3
 
 ### run_008 — search.py (SigLIP2-SO400M-512 configs 110–112)
 - **Started**: 2026-06-08

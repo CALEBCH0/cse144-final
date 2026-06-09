@@ -631,6 +631,53 @@ Systematic search over unfreeze depth and epoch count for the 512px variant, all
 - **512px best (94.72%) < 384px best (95.27%) by −0.55%.** Native resolution is confirmed optimal for SigLIP2. The positional embedding interpolation from 384px pretraining to 512px inference degrades patch-level alignment, and ~1079 training images cannot compensate.
 - **Ensemble potential:** Despite the regression, 94.72% at 512px is a viable second model for a soft-weighted ensemble with the 384px SigLIP2 (competitor achieved 97% from a similar 96.4%+95.4% pairing). Error patterns differ by resolution — the ensemble may recover some of the 5.3% test errors that neither resolution alone handles.
 
+#### 5.5.33 DINOv3 pipeline run + SigLIP2-384 × DINOv3 ensemble grid search (run_010)
+
+
+Full 5-fold CV pipeline run of DINOv3 (cfg 118 settings: unfreeze=4, lr=1e-4, LLRD=0.75, 50ep) to save probability arrays for offline ensemble analysis. After run_010, `ensemble_grid.py` was run to find the optimal soft weight between SigLIP2-384 probs (from run_009) and DINOv3 probs.
+
+**DINOv3 pipeline result:** val acc = **93.70%**, F1 = 0.9349.
+
+**Ensemble grid search — `(1−w)×SigLIP2-384 + w×DINOv3`:**
+
+| w (DINOv3) | CV Acc | F1 |
+|---|---|---|
+| 0.00 (SigLIP2 solo) | 94.90% | 0.9476 |
+| 0.05 | 94.90% | 0.9476 |
+| 0.10 | 94.81% | 0.9467 |
+| … | … | … |
+| 0.60 | 94.81% | 0.9455 |
+| **0.65** | **95.00%** | **0.9477** |
+| 0.70 | 94.53% | 0.9427 |
+| … | … | … |
+| 1.00 (DINOv3 solo) | 93.70% | 0.9349 |
+
+**Best: w=0.65 → `0.35×SigLIP2-384 + 0.65×DINOv3` = 95.00% CV (+0.10% over SigLIP2 solo)**
+
+**Key findings:**
+
+- **Optimal w=0.65 favors DINOv3** despite it being the weaker model (93.70% vs 94.90%). This is the complementarity effect: DINOv3's self-supervised patch-distillation features encode different visual patterns than SigLIP2's image-text contrastive features, so the two models' errors are partially independent.
+- **Gain is modest (+0.10%)** because the 1.2-point accuracy gap limits decorrelation. When one model is significantly weaker, P(both wrong on the same example) is still high — the ensemble can only recover errors where exactly one model fails, but that set is small at 94.90% vs 93.70%.
+- **Same-backbone ensemble (SigLIP2-384 + SigLIP2-512, w=0.10) got +0.19%** — slightly better than the cross-architecture ensemble (+0.10%) despite the same-backbone errors being more correlated. The 384+512 pairing benefits from resolution diversity even though the feature distributions are highly aligned.
+- **Ensemble pseudo-labels for R2:** The 95.00% CV ensemble produces higher-quality pseudo-labels than either model alone. Running R2 with `PSEUDO_LABEL_ENSEMBLE_WEIGHTS={"siglip2_so400m": 0.35, "dinov3": 0.65}` is the next step (run_011).
+
+#### 5.5.34 Ensemble pseudo-label R2 — SigLIP2 solo (run_011b)
+
+SigLIP2 retrained in R2 using pseudo-labels generated from the soft-weighted ensemble `0.35×SigLIP2-384 + 0.65×DINOv3` (the best CV combination found in section 5.5.33, 95.00%). Pseudo-label source loaded from saved `probs/test_probs_*.npy` files without retraining DINOv3.
+
+| Round | CV Acc | F1 | Notes |
+|---|---|---|---|
+| R1 | 95.00% | 0.9429 | Consistent with run_009 |
+| **R2** | **95.09%** | **0.9429** | +0.09% from ensemble pseudo-labels |
+
+**Key findings:**
+
+- **Ensemble pseudo-labels give +0.09%** — identical to run_004c self-distillation gain (+0.09%). The higher-quality pseudo-label source (95.00% ensemble vs 94.90% solo) does not improve the R2 gain.
+- **The limiting factor is the number of confident test images, not label quality.** At threshold=0.97, the ensemble accepts ~N pseudo-labels; the quality improvement from 94.90%→95.00% source adds negligibly to that count or their individual accuracy.
+- **SigLIP2 R1 at 95.00% is rock-stable** across all runs (run_009: 94.90%, run_011b: 95.00%, run_004c R1: 95.18%). Variance is within run-to-run noise from stratified fold splitting.
+- **Hard classes persist:** class 63 (F1=0.43), class 86 (0.48), class 88 (0.45) remain below 0.50 in R2. Pseudo-labeling cannot help hard classes where the model is uncertain — test images from those classes don't reach the 0.97 confidence threshold.
+- **run_011 (SigLIP2+DINOv3 joint) crashed** at SigLIP2 fold 3 due to Windows memory fragmentation after DINOv3's 78-min prior run. Run solo (run_011b) completed cleanly — consistent with run_009 confirming SigLIP2 solo is safe within the available RAM budget.
+
 ---
 
 ### 5.6 Overall Best Results Summary
@@ -647,12 +694,17 @@ Systematic search over unfreeze depth and epoch count for the 512px variant, all
 | DINOv2-Base | 85.54% | — | 64 | unfreeze=2, lr=1e-4, LLRD=0.85, 10ep |
 | DINOv2-Large (search) | 87.39% | — | 80 | unfreeze=2, lr=1e-4, LLRD=0.75, 50ep |
 | DINOv2-Large (pipeline, upsample) | 89.71% | — | run_005a | unfreeze=2, 50ep, upsample min=20 |
-| DINOv3 ViT-L/16 | 93.79% | — | 118 | unfreeze=4, lr=1e-4, 50ep |
+| DINOv3 ViT-L/16 (search) | 93.79% | — | 118 | unfreeze=4, lr=1e-4, 50ep |
+| DINOv3 ViT-L/16 (pipeline) | 93.70% | — | run_010 | unfreeze=4, lr=1e-4, 50ep, upsample min=20 |
 | SigLIP2-SO400M-512 (run_005) | 94.53% | — | run_005 | unfreeze=6, 15ep (suboptimal) |
 | SigLIP2-SO400M-512 (cfg 112) | 94.72% | — | 112 | unfreeze=2, lr=1e-4, 20ep (optimal 512px) |
+| Soft ensemble: SigLIP2-384 + SigLIP2-512 (w=0.10) | 95.09% | — | run_009 | 0.90×384px + 0.10×512px |
 | SigLIP2-SO400M-384 (cfg 104) | 95.00% | — | 104 | unfreeze=2, lr=1e-4, LLRD=0.8, 20ep |
 | SigLIP2-SO400M-384 R1 (run_004c) | 95.18% | — | run_004c | pipeline, unfreeze=2, 20ep |
+| SigLIP2-SO400M-384 R1 (run_011b) | 95.00% | — | run_011b | pipeline, unfreeze=2, 20ep |
 | Hard routing (run_005a R1) | 95.09% | — | run_005a | DINOv2-Large + SigLIP2, log-prob z-score |
+| Soft ensemble: SigLIP2-384 + DINOv3 (w=0.65) | 95.00% | — | run_010 | 0.35×SigLIP2 + 0.65×DINOv3 |
+| SigLIP2-SO400M-384 R2 (run_011b) | 95.09% | — | run_011b | ensemble pseudo-label (0.35×SigLIP2 + 0.65×DINOv3) |
 | **SigLIP2-SO400M-384 R2** | **95.27%** | **95.454%** | **run_004c** | **self-distillation pseudo-label, 5th place** |
 
 ### 5.7 Pipeline Run — Class-Routed Ensemble (DINOv2-Base + DINOv2-Large)
@@ -696,12 +748,12 @@ The routed ensemble (+0.37% over Large alone) confirms that Base and Large are c
 
 3. **Limitations and next steps.**
    - **SigLIP2-SO400M-384 is the dominant backbone.** At 95.00% (search config 104) and 95.27% CV / 95.454% Kaggle (run_004c with pseudo-labels), it outperforms DINOv2-Large by 7.9 points. The gap reflects fundamentally better pretraining (image-text pairs at native 384px resolution vs self-supervised on ImageNet).
-   - **Self-distillation pseudo-labeling works; blended ensemble pseudo-labels do not.** +0.09% CV, +0.64% Kaggle test when SigLIP2 generates its own pseudo-labels. Zero gain when diluted by DINOv2 predictions (5.5.27).
+   - **Self-distillation pseudo-labeling gives +0.09% CV consistently.** run_004c (self-distillation, 94.90% source) and run_011b (ensemble pseudo-labels, 95.00% source) both produce exactly +0.09% R2 gain. The limiting factor is the number of test images that exceed the 0.97 confidence threshold, not the label accuracy. Zero gain when diluted by much weaker models (DINOv2, 5.5.27).
    - **Hard class routing with log-prob z-score normalisation is neutral at −0.09% CV** (5.5.29). With a dominant model (SigLIP2 at 95%) and one much weaker model (DINOv2-Large at 90%), routing cannot improve the mean — the weaker model "wins" only easy classes where both models already score F1=1.0. Routing may add test-set value on the 9 hard classes where DINOv2-Large leads by per-class val F1, but this is unverifiable from CV alone.
    - **Higher resolution consistently hurts.** SigLIP2-512: −0.47% at suboptimal settings (run_005), −0.55% even at optimal settings (cfg 112, unfreeze=2, 94.72%). DINOv2-518: −9.64% (configs 85–87). Token sequence expansion exceeds what ~1079 training images can support; positional embedding interpolation noise from 384px pretraining dominates. Native resolution is confirmed optimal across all tested models.
    - **Class weights ruled out.** Inverse-frequency weighting hurts all models (SigLIP-Base −0.75%, DINOv2-Large −2.13%). Distorts gradient balance more than it helps rare classes at this scale.
    - **Upsample balance (`USE_UPSAMPLE_BALANCE=True`, min=20)** helps DINOv2-Large significantly (+2.32 pts, 87.39% → 89.71%). Effect on SigLIP2 not yet isolated.
-   - **DINOv3 best: 93.79% (cfg 118, unfreeze=4, 50ep).** Strong but 1.48 pts below SigLIP2. Its complementary pretraining (self-supervised patch distillation vs SigLIP2's image-text contrastive) makes it a candidate for soft-weighted ensemble; a weight grid search over SigLIP2-384 + DINOv3 is the logical next step.
+   - **DINOv3 best: 93.79% (cfg 118) / 93.70% (pipeline, run_010).** Strong but 1.48 pts below SigLIP2. Soft-weighted ensemble grid search (run_010) found `0.35×SigLIP2 + 0.65×DINOv3` = **95.00%** (+0.10% over SigLIP2 solo). Gain is modest due to the accuracy gap; however, the 95.00% ensemble produces higher-quality pseudo-labels for R2 retraining (run_011 staged).
    - **CLIP-ViT-Large/14 deprioritised.** Bug fixed (missing `.config`), but SigLIP2's 95% makes CLIP-ViT results less strategically relevant with 3 days remaining.
    - **Label-mixing and spatial augmentation ineffective.** Mixup (−2%), CutMix (−6%), RandAugment neutral-to-negative across all tested models. Disabled in the final pipeline.
    - **Kaggle submissions per config** available at `search_results/config_{i}_{model}.csv`.

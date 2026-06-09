@@ -469,3 +469,24 @@ def apply_lora(model, model_name, r=8, lora_alpha=16, lora_dropout=0.05):
         bias="none",
     )
     return get_peft_model(model, lora_config)
+
+
+def top_confusion_pairs(true_labels, pred_labels, class_names, top_n=10):
+    """Return the top_n most-confused class pairs from pooled CV predictions.
+
+    Returns list of (class_a, class_b, n_errors, error_rate) sorted by n_errors desc.
+    error_rate = symmetric confusion / (total predictions on both classes).
+    """
+    from sklearn.metrics import confusion_matrix
+    n = len(class_names)
+    cm = confusion_matrix(true_labels, pred_labels, labels=list(range(n)))
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            n_confused = cm[i, j] + cm[j, i]
+            if n_confused == 0:
+                continue
+            rate = n_confused / max(cm[i].sum() + cm[j].sum(), 1)
+            pairs.append((int(class_names[i]), int(class_names[j]), n_confused, rate))
+    pairs.sort(key=lambda x: -x[2])
+    return pairs[:top_n]

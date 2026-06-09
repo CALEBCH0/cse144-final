@@ -36,6 +36,7 @@ from utils import (
     apply_lora,
     predict_test_images,
     signal,
+    top_confusion_pairs,
 )
 
 RESULTS_FILE = "search_results.csv"
@@ -435,6 +436,8 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
     fold_train_sec = []
     fold_eval_sec = []
     fold_models = []
+    pooled_true = []
+    pooled_pred = []
 
     for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
         signal("fold_start", config=cfg_index, fold=fold_idx + 1, n_folds=N_FOLDS, model=cfg["model"])
@@ -524,6 +527,8 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
 
         preds = np.argmax(preds_out.predictions, axis=1)
         true  = preds_out.label_ids
+        pooled_true.extend(true.tolist())
+        pooled_pred.extend(preds.tolist())
 
         per_class = f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0)
         fold_per_class_f1.append(per_class)
@@ -549,6 +554,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
     mean_train_sec = float(np.mean(fold_train_sec)) if fold_train_sec else 0.0
     mean_eval_sec  = float(np.mean(fold_eval_sec))  if fold_eval_sec  else 0.0
     mean_per_class_f1 = np.mean(fold_per_class_f1, axis=0) if fold_per_class_f1 else np.zeros(num_labels)
+    confusion_pairs = top_confusion_pairs(pooled_true, pooled_pred, class_names) if pooled_true else []
 
     return (
         {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")},
@@ -557,6 +563,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         mean_eval_sec,
         fold_models,
         mean_per_class_f1,
+        confusion_pairs,
     )
 
 
@@ -658,7 +665,7 @@ def main():
 
             model_cfg = model_lookup[cfg["model"]]
             try:
-                mean, std, mean_train_sec, mean_eval_sec, fold_models, mean_per_class_f1 = run_cv(
+                mean, std, mean_train_sec, mean_eval_sec, fold_models, mean_per_class_f1, confusion_pairs = run_cv(
                     cfg, model_cfg, full_dataset, fold_splits,
                     class_names, num_labels, label2id, id2label,
                     cfg_index=i,
@@ -695,6 +702,12 @@ def main():
                     print(f"    class {j:>3} ({name}): F1={val:.3f}")
                 if len(hard) > 10:
                     print(f"    ... and {len(hard)-10} more")
+
+            # ── confusion pair analysis ───────────────────────────────────
+            if confusion_pairs:
+                print(f"  Top confused pairs (pooled {N_FOLDS}-fold val):")
+                for c_a, c_b, n_err, rate in confusion_pairs[:5]:
+                    print(f"    classes {c_a}↔{c_b}: {n_err:>3} errors, rate={rate:.2f}")
 
             # ── generate Kaggle submission CSV ────────────────────────────
             data_root = os.path.dirname(TRAIN_DIR)

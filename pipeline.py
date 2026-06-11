@@ -198,6 +198,7 @@ def run_training_loop(
         fold_per_class_precision = []
         fold_per_class_recall = []
         fold_models = []
+        fold_test_probs_list = []  # R2 only: per-fold test probs (avoids accumulating heavy models in RAM)
         fold_train_sec = []
         fold_eval_sec = []
         pooled_true = []
@@ -320,9 +321,21 @@ def run_training_loop(
                 tta_f1 = f1_score(true, tta_preds, average="macro", zero_division=0)
                 print(f"  Fold {fold_idx + 1} TTA:  acc={tta_acc:.4f}  f1={tta_f1:.4f}  (delta acc {tta_acc - fold_metrics[-1]['accuracy']:+.4f})")
 
-            if USE_ENSEMBLE or USE_CLASS_ROUTING:
-                model.cpu()  # free VRAM before next fold loads its model from disk
+            if image_paths:
+                # Run per-fold test inference immediately and free model to avoid CPU RAM OOM.
+                # Accumulating fold models (~1.6 GB each) exhausts Windows virtual address space by fold 3.
+                _fold_tp = get_test_probs([model], image_paths, val_tf)
+                fold_test_probs_list.append(_fold_tp)
+                del model
+                import gc; gc.collect()
+                torch.cuda.empty_cache()
+            elif USE_ENSEMBLE or USE_CLASS_ROUTING:
+                model.cpu()
                 fold_models.append(model)
+            else:
+                del model
+                import gc; gc.collect()
+                torch.cuda.empty_cache()
 
             # Free trainer, fold datasets, and flush before next fold
             del trainer, train_fold, train_fold_raw, val_fold
@@ -375,7 +388,7 @@ def run_training_loop(
         if confusion_pairs:
             print(f"  Top confused pairs (pooled {N_FOLDS}-fold val):")
             for c_a, c_b, n_err, rate in confusion_pairs[:5]:
-                print(f"    classes {c_a}↔{c_b}: {n_err:>3} errors, rate={rate:.2f}")
+                print(f"    classes {c_a}<->{c_b}: {n_err:>3} errors, rate={rate:.2f}")
 
         if USE_ENSEMBLE and len(fold_models) > 1:
             print(f"\n  Running ensemble ({len(fold_models)} fold models) on full dataset...")
@@ -399,13 +412,18 @@ def run_training_loop(
             print(f"  Val probs saved: probs/val_probs_{name}.npy")
 
         # ── Kaggle test inference ──────────────────────────────────────────────
-        submission_models = fold_models if fold_models else [model]
+        submission_models = fold_models if fold_models else []
 
         if image_paths:
             round_n = 2 if suffix else 1
             sub_path = _make_sub_path(run_id, [name], round_n, pseudo_src_tag)
-            print(f"\n  Predicting {len(test_ids)} test images ({len(submission_models)} fold model(s))...")
-            test_probs = get_test_probs(submission_models, image_paths, val_tf)
+            if fold_test_probs_list:
+                # R2: fold models were freed per-fold; average the per-fold test probs accumulated above
+                test_probs = np.mean(fold_test_probs_list, axis=0).astype(np.float32)
+                print(f"\n  Test probs averaged from {len(fold_test_probs_list)} fold(s) (R2 per-fold inference).")
+            else:
+                print(f"\n  Predicting {len(test_ids)} test images ({len(submission_models)} fold model(s))...")
+                test_probs = get_test_probs(submission_models, image_paths, val_tf)
             np.save(f"probs/test_probs_{name}.npy", test_probs)
             print(f"  Test probs saved: probs/test_probs_{name}.npy")
             test_preds = test_probs.argmax(axis=1)
@@ -575,6 +593,8 @@ def main():
     parser.add_argument("--message", type=str, default="pipeline run", metavar="MSG", help="Kaggle submission message (used with --submit)")
     parser.add_argument("--run-id", type=str, default="run", dest="run_id", metavar="ID",
                         help="Run identifier for submission naming (e.g. run012)")
+    parser.add_argument("--r2-only", action="store_true", dest="r2_only",
+                        help="Skip R1 training; use existing probs/test_probs_*.npy for pseudo-labeling")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -611,11 +631,23 @@ def main():
         image_paths = [os.path.join(test_dir, img_id) for img_id in test_ids]
 
     # ── Round 1: train on real data ────────────────────────────────────────────
-    results, fold_models_by_name, val_probs_by_fold, val_tf_by_name = run_training_loop(
-        TRAIN_DIR, full_dataset, class_names, num_labels, label2id, id2label,
-        all_label_ids, fold_splits, selected, image_paths, test_ids,
-        run_id=args.run_id,
-    )
+    if args.r2_only:
+        # Skip R1 — load R1 accuracy from saved test_probs to build the results stub
+        print("--r2-only: skipping R1 training, using existing probs/test_probs_*.npy")
+        results = {}
+        for cfg in selected:
+            _tp = os.path.join("probs", f"test_probs_{cfg['name']}.npy")
+            if not os.path.exists(_tp):
+                raise FileNotFoundError(f"--r2-only requires {_tp} from a completed R1 run")
+            # Accuracy stub — only used to pick the best pseudo-label source model
+            results[cfg["name"]] = {"mean": {"accuracy": 1.0}}
+        fold_models_by_name, val_probs_by_fold, val_tf_by_name = {}, {}, {}
+    else:
+        results, fold_models_by_name, val_probs_by_fold, val_tf_by_name = run_training_loop(
+            TRAIN_DIR, full_dataset, class_names, num_labels, label2id, id2label,
+            all_label_ids, fold_splits, selected, image_paths, test_ids,
+            run_id=args.run_id,
+        )
 
     if USE_CLASS_ROUTING and len(results) > 1:
         results = _run_class_routing(
@@ -647,16 +679,21 @@ def main():
             # Free round-1 models — not needed for pseudo-label generation
             del fold_models_by_name
         else:
-            # Use strongest R1 model (self-distillation / knowledge distillation).
+            # Self-distillation: load pre-saved test probs from R1 (saved by run_training_loop).
+            # Fold models were freed after R1 when USE_CLASS_ROUTING=False — use the npy instead.
             _pseudo_src = max(
-                (n for n in fold_models_by_name if n in results),
+                (n for n in SELECTED_MODELS if n in results),
                 key=lambda n: results[n]["mean"]["accuracy"],
             )
-            print(f"  Pseudo-label source: {_pseudo_src} (acc={results[_pseudo_src]['mean']['accuracy']:.4f})")
-            test_probs = get_test_probs(
-                fold_models_by_name[_pseudo_src], image_paths, val_tf_by_name[_pseudo_src]
-            )
-            # Free round-1 models before round-2 to avoid Windows page-file OOM
+            _tp_path = os.path.join("probs", f"test_probs_{_pseudo_src}.npy")
+            if os.path.exists(_tp_path):
+                test_probs = np.load(_tp_path).astype(np.float32)
+                print(f"  Pseudo-label source: {_pseudo_src} (loaded {_tp_path}, acc={results[_pseudo_src]['mean']['accuracy']:.4f})")
+            else:
+                # Fallback when fold models are still in memory (USE_CLASS_ROUTING=True path)
+                test_probs = get_test_probs(
+                    fold_models_by_name[_pseudo_src], image_paths, val_tf_by_name[_pseudo_src]
+                )
             del fold_models_by_name
         import torch as _torch; _torch.cuda.empty_cache()
 
@@ -667,25 +704,24 @@ def main():
         print(f"  Accepting {n_pseudo}/{len(test_ids)} pseudo-labels (conf>={PSEUDO_LABEL_THRESHOLD})")
 
         if n_pseudo > 0:
-            # Build pseudo dataset in memory using PIL images
-            from datasets import Dataset, Features, ClassLabel, Image as HFImage
+            # Build pseudo dataset from file paths to avoid loading all PIL images into RAM at once
+            from datasets import Dataset, concatenate_datasets
             from PIL import Image as PILImage
 
-            pseudo_images, pseudo_label_list = [], []
+            pseudo_paths, pseudo_label_list = [], []
             for i, fpath in enumerate(image_paths):
                 if confident_mask[i]:
-                    pseudo_images.append(PILImage.open(fpath).convert("RGB"))
+                    pseudo_paths.append(fpath)
                     pseudo_label_list.append(int(pseudo_labels[i]))
 
-            # Concatenate with original training set (val is always real data only)
-            orig_images = [full_dataset[i]["image"] for i in range(len(full_dataset))]
-            orig_labels = full_dataset["label"]
-
+            # Use file paths — HuggingFace Image feature decodes lazily at access time
             combined_features = full_dataset.features
-            pseudo_dataset = Dataset.from_dict(
-                {"image": orig_images + pseudo_images, "label": list(orig_labels) + pseudo_label_list},
+            pseudo_only = Dataset.from_dict(
+                {"image": pseudo_paths, "label": pseudo_label_list},
                 features=combined_features,
             )
+            # Concatenate lazily — orig images stay on disk until needed per-batch
+            pseudo_dataset = concatenate_datasets([full_dataset, pseudo_only])
 
             print(f"  Combined dataset: {len(full_dataset)} real + {n_pseudo} pseudo = {len(pseudo_dataset)} total")
 

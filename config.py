@@ -1,14 +1,14 @@
 SELECTED_MODELS = [
-    "siglip2_so400m",  # run_012 — R1 solo, clean val_probs regeneration (no pseudo-labels)
+    "siglip2_so400m",  # run_015 — SEED=0, independent fold splits for ensemble diversity
 ]
 
-# Ensemble weights for pseudo-label generation (from ensemble_grid.py grid search, run_010)
-# Best CV: 0.35*siglip2_so400m + 0.65*dinov3 = 95.00%
-PSEUDO_LABEL_ENSEMBLE_WEIGHTS = {}  # cleared for run_012 — R1 only, no pseudo-labels
+# Ensemble weights for pseudo-label generation
+# Empty = use self-distillation (strongest R1 model generates its own pseudo-labels)
+PSEUDO_LABEL_ENSEMBLE_WEIGHTS = {}
 
 GPU_MEMORY_FRACTION = 0.85
 
-SEED = 42
+SEED = 0
 TRAIN_DIR = __import__("os").environ.get("TRAIN_DIR", "data/train")
 NUM_EPOCHS = 10
 BATCH_SIZE = 32
@@ -34,7 +34,7 @@ USE_RANDAUGMENT = False        # Best DINOv2 config (84.24%) used no augmentatio
 USE_RANDOM_ERASING = False     # Marginal in full stack; disabled until more data
 USE_LORA = False               # LoRA adapters (dinov2 / vit only); overrides freeze strategy
 USE_CLASS_ROUTING = False      # Disabled — using soft ensemble grid search instead
-USE_PSEUDO_LABEL = False       # run_012: R1 only — regenerating clean val_probs (no pseudo-labels)
+USE_PSEUDO_LABEL = True        # run_013: R2 self-distillation (threshold=0.97)
 PSEUDO_LABEL_THRESHOLD = 0.97  # Min softmax confidence to accept a pseudo-label
 USE_CLASS_WEIGHTS = False      # Hurts all models (SigLIP-Base -0.75%, DINOv2-Large -2.13%); disabled
 USE_UPSAMPLE_BALANCE = True    # min=20 matches run_004c (SigLIP2 95.18% baseline)

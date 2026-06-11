@@ -82,7 +82,8 @@ def print_results(results: dict, class_names: list, num_labels: int,
     print(f"{'model':>14} {'train acc':>14} {'val acc':>14} {'precision':>16} {'recall':>16} {'f1':>16} {'time':>10}")
     print("-" * 102)
     for name in model_names:
-        m, s = results[name]["mean"], results[name]["std"]
+        m = results[name]["mean"]
+        s = results[name].get("std", {k: 0.0 for k in m})
         tr_acc  = results[name].get("train_acc_mean", float("nan"))
         tr_std  = results[name].get("train_acc_std",  0.0)
         dur = _fmt_duration(results[name].get("total_train_sec", 0))
@@ -163,7 +164,8 @@ def export_results(path: str, results: dict, class_names: list, num_labels: int,
         "-" * 102 + "\n",
     ]
     for name in model_names:
-        m, s = results[name]["mean"], results[name]["std"]
+        m = results[name]["mean"]
+        s = results[name].get("std", {k: 0.0 for k in m})
         tr_acc = results[name].get("train_acc_mean", float("nan"))
         tr_std = results[name].get("train_acc_std",  0.0)
         dur = _fmt_duration(results[name].get("total_train_sec", 0))

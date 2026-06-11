@@ -707,7 +707,7 @@ def main():
             if confusion_pairs:
                 print(f"  Top confused pairs (pooled {N_FOLDS}-fold val):")
                 for c_a, c_b, n_err, rate in confusion_pairs[:5]:
-                    print(f"    classes {c_a}↔{c_b}: {n_err:>3} errors, rate={rate:.2f}")
+                    print(f"    classes {c_a}<->{c_b}: {n_err:>3} errors, rate={rate:.2f}")
 
             # ── generate Kaggle submission CSV ────────────────────────────
             data_root = os.path.dirname(TRAIN_DIR)

@@ -12,9 +12,9 @@ RUN CONFIGURATION
 MODEL COMPARISON (5-fold CV, mean ± std)
          model      train acc        val acc        precision           recall               f1       time
 ------------------------------------------------------------------------------------------------------
-siglip2_so400m 0.9965±0.0031  0.9500±0.0161  0.9544±0.0156  0.9482±0.0155  0.9429±0.0162     1h39m
+siglip2_so400m 0.9963±0.0035  0.9490±0.0152  0.9504±0.0124  0.9472±0.0144  0.9407±0.0138     1h37m
 
-Best model: siglip2_so400m (mean val acc 95.00%)
+Best model: siglip2_so400m (mean val acc 94.90%)
 
 ========================================================================
 PER-CLASS F1 (mean across 5 folds) — sorted by model spread (delta)
@@ -25,7 +25,7 @@ PER-CLASS F1 (mean across 5 folds) — sorted by model spread (delta)
   ------------------------------------------------
   0               1.0000*  siglip2_so400m   0.0000
   1               0.9200*  siglip2_so400m   0.0000
-  10              0.9200*  siglip2_so400m   0.0000
+  10              0.9600*  siglip2_so400m   0.0000
   11              0.9333*  siglip2_so400m   0.0000
   12              0.8933*  siglip2_so400m   0.0000
   13              0.8533*  siglip2_so400m   0.0000
@@ -36,7 +36,7 @@ PER-CLASS F1 (mean across 5 folds) — sorted by model spread (delta)
   18              1.0000*  siglip2_so400m   0.0000
   19              0.9333*  siglip2_so400m   0.0000
   2               0.9600*  siglip2_so400m   0.0000
-  20              0.8933*  siglip2_so400m   0.0000
+  20              0.9600*  siglip2_so400m   0.0000
   21              1.0000*  siglip2_so400m   0.0000
   22              1.0000*  siglip2_so400m   0.0000
   23              1.0000*  siglip2_so400m   0.0000
@@ -83,19 +83,19 @@ PER-CLASS F1 (mean across 5 folds) — sorted by model spread (delta)
   60              1.0000*  siglip2_so400m   0.0000
   61              1.0000*  siglip2_so400m   0.0000
   62              1.0000*  siglip2_so400m   0.0000
-  63              0.4267*  siglip2_so400m   0.0000
+  63              0.3933*  siglip2_so400m   0.0000
   64              1.0000*  siglip2_so400m   0.0000
   65              1.0000*  siglip2_so400m   0.0000
   66              0.9333*  siglip2_so400m   0.0000
   67              1.0000*  siglip2_so400m   0.0000
-  68              0.7600*  siglip2_so400m   0.0000
+  68              0.6267*  siglip2_so400m   0.0000
   69              0.9314*  siglip2_so400m   0.0000
   7               0.9333*  siglip2_so400m   0.0000
-  70              0.6781*  siglip2_so400m   0.0000
+  70              0.5448*  siglip2_so400m   0.0000
   71              1.0000*  siglip2_so400m   0.0000
   72              0.9600*  siglip2_so400m   0.0000
   73              0.7667*  siglip2_so400m   0.0000
-  74              0.9029*  siglip2_so400m   0.0000
+  74              0.8762*  siglip2_so400m   0.0000
   75              1.0000*  siglip2_so400m   0.0000
   76              0.6600*  siglip2_so400m   0.0000
   77              1.0000*  siglip2_so400m   0.0000

@@ -680,6 +680,50 @@ SigLIP2 retrained in R2 using pseudo-labels generated from the soft-weighted ens
 
 ---
 
+#### 5.5.35 Clean val_probs regeneration + confidence-gated ensemble (run_012)
+
+Run_012 regenerated clean `probs/val_probs_siglip2_so400m.npy` after the R2 overwrite bug corrupted the previous file. A 2D confidence-gated ensemble grid search then tested all combinations of `w ∈ [0.0, 0.5]` and `conf_threshold ∈ [0.80, 1.00]`.
+
+**SigLIP2 R1 results (run_012):**
+
+| CV Acc | F1 | Notes |
+|---|---|---|
+| 94.90% | 0.9407 | Consistent with run_009; R1 only (no pseudo-labels) |
+
+**Confusion pairs (pooled 5-fold val):**
+
+| Pair | Errors | Rate |
+|---|---|---|
+| 63 <-> 70 | 8 | 0.42 |
+| 76 <-> 78 | 7 | 0.30 |
+| 86 <-> 88 | 7 | 0.32 |
+| 86 <-> 87 | 6 | 0.26 |
+| 68 <-> 74 | 4 | 0.16 |
+
+**2D confidence-gated ensemble grid search (SigLIP2-384 + DINOv3):**
+
+| w (DINOv3) | conf threshold | CV Acc | gated |
+|---|---|---|---|
+| 0.00 | any | **94.90%** | — |
+| 0.05–0.10 | any | 94.90% | flat, no change |
+| 0.15 | ≥0.95 | 94.90% | 870/1079 gated in |
+| 0.15–0.50 | <0.95 | 94.81–94.53% | hurt |
+
+Best: `w=0.00` at all confidence levels — DINOv3 never improves over SigLIP2 solo regardless of gating threshold.
+
+**Key findings:**
+
+- **DINOv3 ensemble path definitively closed.** The confidence gate (restricting DINOv3 to high-confidence predictions) does not rescue the combination. Even w=0.05–0.10 is completely neutral, and any w≥0.15 below conf=0.95 hurts.
+- **run_010's w=0.65 → 95.00% was model-weight-specific overfitting.** That result used run_009's specific SigLIP2 model weights; DINOv3 happened to correct run_009's errors. With run_012's different (though same-accuracy) weights, the same DINOv3 probs offer no complementary signal.
+- **The 91.818% Kaggle score is explained.** Val-overfitted ensemble weights (w=0.65 selected on 1079 samples ≈ 10 per class) hurt on the 1036-image test set where DINOv3's systematic fine-grained errors dominated.
+- **New confusion pair discovered:** class 63 ↔ 70 (rate=0.42) is the most confused pair — higher than the expected 76/78 and 86/87/88 clusters. Class 70 was not previously flagged as hard.
+
+**SigLIP2-384 + SigLIP2-512 ensemble re-evaluation with clean probs:**
+
+With fresh `val_probs_siglip2_so400m.npy` (run_012), the 384+512 ensemble grid was re-run using the existing `probs/val_probs_siglip2_so400m_512.npy` (run_009). Optimal weight shifted from w=0.10 (run_009 probs, 95.09%) to **w=0.20 (run_012 probs, 95.00%)**. Submitted to Kaggle: **94.545%** (−0.455 pts CV→test gap). The same-backbone ensemble also exhibits val-overfitting on 1079 samples — resolution diversity does not provide enough independent signal to generalize.
+
+---
+
 ### 5.6 Overall Best Results Summary
 
 | Model | Best CV acc | Kaggle | Config | Key settings |
@@ -698,13 +742,14 @@ SigLIP2 retrained in R2 using pseudo-labels generated from the soft-weighted ens
 | DINOv3 ViT-L/16 (pipeline) | 93.70% | — | run_010 | unfreeze=4, lr=1e-4, 50ep, upsample min=20 |
 | SigLIP2-SO400M-512 (run_005) | 94.53% | — | run_005 | unfreeze=6, 15ep (suboptimal) |
 | SigLIP2-SO400M-512 (cfg 112) | 94.72% | — | 112 | unfreeze=2, lr=1e-4, 20ep (optimal 512px) |
-| Soft ensemble: SigLIP2-384 + SigLIP2-512 (w=0.10) | 95.09% | — | run_009 | 0.90×384px + 0.10×512px |
+| Soft ensemble: SigLIP2-384 + SigLIP2-512 (w=0.20) | 95.00% | **94.545%** | run_012 | fresh probs re-eval; val-overfitted (+0.19→−0.45 gap) |
 | SigLIP2-SO400M-384 (cfg 104) | 95.00% | — | 104 | unfreeze=2, lr=1e-4, LLRD=0.8, 20ep |
 | SigLIP2-SO400M-384 R1 (run_004c) | 95.18% | — | run_004c | pipeline, unfreeze=2, 20ep |
 | SigLIP2-SO400M-384 R1 (run_011b) | 95.00% | — | run_011b | pipeline, unfreeze=2, 20ep |
 | Hard routing (run_005a R1) | 95.09% | — | run_005a | DINOv2-Large + SigLIP2, log-prob z-score |
-| Soft ensemble: SigLIP2-384 + DINOv3 (w=0.65) | 95.00% | — | run_010 | 0.35×SigLIP2 + 0.65×DINOv3 |
+| Soft ensemble: SigLIP2-384 + DINOv3 (w=0.65) | 95.00% | — | run_010 | 0.35×SigLIP2 + 0.65×DINOv3 (val-overfitted, 91.818% Kaggle) |
 | SigLIP2-SO400M-384 R2 (run_011b) | 95.09% | — | run_011b | ensemble pseudo-label (0.35×SigLIP2 + 0.65×DINOv3) |
+| SigLIP2-SO400M-384 R1 (run_012) | 94.90% | — | run_012 | clean val_probs run; conf-gated ensemble showed w=0 optimal |
 | **SigLIP2-SO400M-384 R2** | **95.27%** | **95.454%** | **run_004c** | **self-distillation pseudo-label, 5th place** |
 
 ### 5.7 Pipeline Run — Class-Routed Ensemble (DINOv2-Base + DINOv2-Large)
@@ -753,7 +798,7 @@ The routed ensemble (+0.37% over Large alone) confirms that Base and Large are c
    - **Higher resolution consistently hurts.** SigLIP2-512: −0.47% at suboptimal settings (run_005), −0.55% even at optimal settings (cfg 112, unfreeze=2, 94.72%). DINOv2-518: −9.64% (configs 85–87). Token sequence expansion exceeds what ~1079 training images can support; positional embedding interpolation noise from 384px pretraining dominates. Native resolution is confirmed optimal across all tested models.
    - **Class weights ruled out.** Inverse-frequency weighting hurts all models (SigLIP-Base −0.75%, DINOv2-Large −2.13%). Distorts gradient balance more than it helps rare classes at this scale.
    - **Upsample balance (`USE_UPSAMPLE_BALANCE=True`, min=20)** helps DINOv2-Large significantly (+2.32 pts, 87.39% → 89.71%). Effect on SigLIP2 not yet isolated.
-   - **DINOv3 best: 93.79% (cfg 118) / 93.70% (pipeline, run_010).** Strong but 1.48 pts below SigLIP2. Soft-weighted ensemble grid search (run_010) found `0.35×SigLIP2 + 0.65×DINOv3` = **95.00%** (+0.10% over SigLIP2 solo). Gain is modest due to the accuracy gap; however, the 95.00% ensemble produces higher-quality pseudo-labels for R2 retraining (run_011 staged).
+   - **DINOv3 best: 93.79% (cfg 118) / 93.70% (pipeline, run_010).** Strong but 1.48 pts below SigLIP2. Soft-weighted ensemble grid search (run_010) found `0.35×SigLIP2 + 0.65×DINOv3` = **95.00%** on val, but this was model-weight-specific overfitting: when re-evaluated with run_012's SigLIP2 probs, the optimal weight is **w=0** (DINOv3 never helps). The confidence-gated ensemble (restricting DINOv3 to high-confidence predictions) also gives w=0 as best across all thresholds. The 91.818% Kaggle score from the w=0.65 submission confirms DINOv3's val-overfitted weights hurt on the real test set. **DINOv3 ensemble is not a viable path forward.**
    - **CLIP-ViT-Large/14 deprioritised.** Bug fixed (missing `.config`), but SigLIP2's 95% makes CLIP-ViT results less strategically relevant with 3 days remaining.
    - **Label-mixing and spatial augmentation ineffective.** Mixup (−2%), CutMix (−6%), RandAugment neutral-to-negative across all tested models. Disabled in the final pipeline.
    - **Kaggle submissions per config** available at `search_results/config_{i}_{model}.csv`.

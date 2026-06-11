@@ -19,7 +19,7 @@ Format: move entry from STAGED → RUNNING (add PID/monitors) → FINISHED (add 
   - 120: unfreeze=6, LLRD=0.65, 50ep → KILLED at fold 3 (~87.96% partial, no .npy)
   - 121: siglip2_so400m unfreeze=2, 20ep, LLRD=0.8, upsample=True → running
 - **Log**: search_run.log
-- **ETA**: ~55 min (5 × ~11 min/fold)
+- **ETA**: ~2h total (5 × ~24 min/fold; upsample adds ~30% training steps)
 
 ---
 

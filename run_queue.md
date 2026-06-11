@@ -7,85 +7,65 @@ Format: move entry from STAGED → RUNNING (add PID/monitors) → FINISHED (add 
 
 ## RUNNING
 
-### run_015 — pipeline.py (SigLIP2 R1+R2, SEED=0 — independent model for ensemble)
-- **Started**: 2026-06-10 14:30 PDT
-- **PID**: 62656
-- **Monitors**: signal=bptuigtno, watchdog=bzyzfq6i2
-- **Script**: pipeline.py --run-id run015
-- **Config**: SEED=0, SELECTED_MODELS=["siglip2_so400m"], USE_PSEUDO_LABEL=True, THRESHOLD=0.97
-- **Log**: pipeline_run.log
-- **ETA**: ~3.5h (R1 ~1.5h + R2 ~1.5h + inference)
-- **Post-completion steps**:
-  ```bash
-  cp probs/val_probs_siglip2_so400m.npy probs/val_probs_siglip2_so400m_r015.npy
-  cp probs/test_probs_siglip2_so400m.npy probs/test_probs_siglip2_so400m_r015r2.npy
-  ```
+### run_006 — search.py (CLIP-ViT cfg 91–93, 120; SigLIP2+upsample cfg 121)
+- **Started**: 2026-06-10 (cfg 91–93 done); cfg 121 relaunched 2026-06-10
+- **PID**: 297476
+- **Monitors**: signal=b4kju0659, watchdog=bi991g1u2
+- **Script**: search.py (CONFIGS_TO_RUN={121})
+- **Configs**:
+  - 91: unfreeze=2, LLRD=0.75, 30ep → acc=86.56% ✓ DONE
+  - 92: unfreeze=4, LLRD=0.75, 30ep → acc=88.23% ✓ DONE (no .npy)
+  - 93: unfreeze=4, LLRD=0.75, 50ep → acc=87.40% ✓ DONE (.npy saved)
+  - 120: unfreeze=6, LLRD=0.65, 50ep → KILLED at fold 3 (~87.96% partial, no .npy)
+  - 121: siglip2_so400m unfreeze=2, 20ep, LLRD=0.8, upsample=True → running
+- **Log**: search_run.log
+- **ETA**: ~55 min (5 × ~11 min/fold)
 
 ---
 
 ## STAGED
 
-### run_016 — ensemble_grid.py (run_013 R2 + run_015 R2 — same-model different-seed ensemble)
-- **Priority**: 1 — after run_015
-- **Script**: ensemble_grid.py
-- **Command**:
-  ```bash
-  .venv-win/Scripts/python.exe ensemble_grid.py --a siglip2_so400m_r013 --b siglip2_so400m_r015 --run-id run016
-  ```
-- **Depends on**: run_015 post-completion copies done
-- **ETA**: ~5 min
-
-### run_015 — pipeline.py (SigLIP2 R2, SEED=0 — independent model for ensemble)
-- **Priority**: 2 — after run_014
-- **Script**: pipeline.py --run-id run015
-- **Config changes from run_013**:
-  ```python
-  SEED = 0                        # was 42 — different fold splits → independent model weights
-  PSEUDO_LABEL_THRESHOLD = 0.97   # keep standard threshold
-  ```
-  All other settings unchanged (SELECTED_MODELS=["siglip2_so400m"], USE_PSEUDO_LABEL=True)
-- **Hypothesis**: Two independently-trained SigLIP2 R2 models (SEED=42 vs SEED=0) have genuinely different fold splits → different error patterns on test set. Soft-weight ensemble of their test_probs (both ~95% accuracy) may generalize better than prior ensembles because there is no systematic accuracy gap between them.
-- **Log**: pipeline_run.log
-- **ETA**: ~3.5h
-- **Post-completion steps** (do immediately after run_015 finishes):
-  ```bash
-  cp probs/val_probs_siglip2_so400m.npy probs/val_probs_siglip2_so400m_r015.npy
-  cp probs/test_probs_siglip2_so400m.npy probs/test_probs_siglip2_so400m_r015r2.npy
-  ```
-  (val_probs backed up separately here because SEED=0 → different fold splits → different OOF preds)
-- **Depends on**: run_013 post-completion steps done
-
-### run_016 — ensemble_grid.py (run_013 R2 + run_015 R2 — same-model different-seed ensemble)
-- **Priority**: 3 — after run_015
-- **Script**: ensemble_grid.py (already supports arbitrary name stems via --a/--b)
-- **Command**:
-  ```bash
-  cd "/mnt/c/Users/Caleb Cho/code/school/cse144-final"
-  .venv-win/Scripts/python.exe ensemble_grid.py --a siglip2_so400m_r013 --b siglip2_so400m_r015 --run-id run016
-  ```
-  Reads: val_probs_siglip2_so400m_r013.npy, val_probs_siglip2_so400m_r015.npy (different-seed OOF preds)
-  Reads: test_probs_siglip2_so400m_r013r2.npy, test_probs_siglip2_so400m_r015r2.npy (R2 preds)
-- **Depends on**: all post-completion copy steps done for run_013 and run_015
-- **ETA**: ~5 min (no GPU needed)
-- **Note**: If run_014 (thresh=0.95) gives clearly better R2 than run_013, substitute r014r2 for r013r2
-
-### run_006 — search.py (CLIP-ViT-Large/14 configs 91–93)
-- **Priority**: 3
-- **Script**: search.py
-- **Change needed**: set `CONFIGS_TO_RUN = {91, 92, 93}` in search.py
-- **Log**: search_run.log
-- **Models**: clip_vit (openai/clip-vit-large-patch14)
-- **Configs**:
-  - 91: baseline (10ep, no class_weights)
-  - 92: +class_weights (expected to hurt)
-  - 93: 20ep, no class_weights
-- **ETA**: ~2.5h
-- **Notes**: Bug fixed (added `self.config = self.vision_model.config`). Result needed for report section 5.5.22.
-- **Depends on**: none
+_(none)_
 
 ---
 
 ## FINISHED
+
+### run_016 — ensemble_grid.py (run_013 R2 + run_015 R2 — different-seed ensemble)
+- **Started**: 2026-06-10 ~18:00 PDT
+- **Completed**: 2026-06-10 ~18:05 PDT
+- **Total time**: ~5 min (no GPU)
+- **Status**: SUCCESS
+- **Script**: `ensemble_grid.py --a siglip2_so400m_r013 --b siglip2_so400m_r015 --run-id run016`
+- **Solo val accs**: r013=94.90%, r015=94.90% (both same; OOF preds from SEED=42 and SEED=0 R1 runs)
+- **Grid search results** (best w=0.30):
+  | w (r015) | val acc | f1 |
+  |---|---|---|
+  | 0.00 (r013 solo) | 0.9490 | 0.9476 |
+  | **0.30** | **0.9518** | **0.9502** |
+  | 0.50 | 0.9462 | 0.9448 |
+  | 1.00 (r015 solo) | 0.9490 | 0.9480 |
+- **Best**: `0.70×r013 + 0.30×r015` → val acc **95.18%** (+0.28pp over solo)
+- **Submission**: `submissions/run016_siglip2_so400m_r013_siglip2_so400m_r015_soft_w30.csv`
+- **Key findings**: Different-seed ensemble delivers +0.28pp CV gain — 3× larger than typical val noise. Asymmetric weight (70/30) suggests SEED=42 model has slightly more reliable predictions. Whether gain holds on test is unknown; val-overfitting risk exists given only 1079 val samples.
+- **Kaggle**: **95.454%** (tied with run_004c best — val-overfitting confirmed; different-seed fold diversity does not generalize to test set)
+- **Next action**: No further ensemble paths remain viable
+
+### run_015 — pipeline.py (SigLIP2 R1+R2, SEED=0 — independent model for ensemble)
+- **Started**: 2026-06-10 14:30 PDT
+- **Completed**: 2026-06-10 17:58 PDT
+- **Total time**: ~3h28m (R1 98.2 min + R2 97.4 min)
+- **Status**: SUCCESS
+- **Config**: SEED=0, SELECTED_MODELS=["siglip2_so400m"], USE_PSEUDO_LABEL=True, THRESHOLD=0.97
+- **R1 Results**: acc=**0.9490**, f1=0.9440 (98.2 min)
+- **R2 Results**: acc=**0.9462**, f1=0.9407 (97.4 min, 801/1036 pseudo-labels accepted)
+- **Pseudo-label count**: 801/1036 test images accepted at conf≥0.97
+- **Submission**: submissions/run015_sig2_r2_pseudo_self.csv
+- **Probs backed up**:
+  - probs/val_probs_siglip2_so400m_r015.npy (R1 OOF, SEED=0)
+  - probs/test_probs_siglip2_so400m_r015r2.npy (R2 test probs)
+- **Key findings**: R2 slightly hurt vs R1 (−0.28pp). Pseudo-labeling gain is noisy: run_004c +0.09%, run_013 0.00%, run_015 −0.28%. Not a reliable boost. run_016 ensemble uses R1 OOF preds to find best blend.
+- **Next action**: run_016 ensemble grid search ✓ DONE
 
 ### run_012 — pipeline.py (SigLIP2 R1 solo) + ensemble_grid.py (2D confidence-gated search)
 - **Started**: 2026-06-09

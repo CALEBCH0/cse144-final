@@ -17,10 +17,32 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
-from datasets import load_dataset
+from collections import Counter as _Counter
+from datasets import Dataset as _Dataset, concatenate_datasets as _concat_ds, load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import StratifiedKFold
 from transformers import TrainingArguments, set_seed
+
+
+def _upsample_to_minimum(raw_fold, min_count=20):
+    labels = raw_fold["label"]
+    counts = _Counter(labels)
+    extras = {"image": [], "label": []}
+    for cls, count in counts.items():
+        needed = min_count - count
+        if needed > 0:
+            idx = [i for i, l in enumerate(labels) if l == cls]
+            for j in range(needed):
+                extras["image"].append(raw_fold[idx[j % len(idx)]]["image"])
+                extras["label"].append(cls)
+    if extras["image"]:
+        extra_ds = _Dataset.from_dict(extras, features=raw_fold.features)
+        upsampled = _concat_ds([raw_fold, extra_ds])
+        n_added = len(extras["image"])
+        print(f"  Upsampled {sum(1 for c in counts if counts[c]<min_count)} rare classes "
+              f"(+{n_added} imgs, {len(raw_fold)}->{len(upsampled)})")
+        return upsampled
+    return raw_fold
 
 from config import GPU_MEMORY_FRACTION, N_FOLDS, SEED, TRAIN_DIR
 from models import MODELS
@@ -34,6 +56,7 @@ from utils import (
     MixupCutMixCollator,
     apply_freeze as _apply_freeze,
     apply_lora,
+    get_test_probs,
     predict_test_images,
     signal,
     top_confusion_pairs,
@@ -65,12 +88,8 @@ CONFIGS_TO_RUN = {
     # 78, 79, 80, 81, 82, 83, 84,  # done / currently running
     # 518px resolution + RandAugment combos
     # 85, 86, 87,  # currently running
-    # CLIP-ViT rerun (91-93 failed due to .config bug, now fixed)
-    # 91, 92, 93,
-    # DINOv3 ViT-L: fastest→slowest (20ep: 113-116, 50ep: 117-119)
-    # 113, 114, 115, 116, 117, 118, 119,  # done
-    # SigLIP2-SO400M-512 resolution search
-    110, 111, 112,
+    # SigLIP2 + upsampling
+    121,
 }
 
 # fmt: off
@@ -290,15 +309,16 @@ SEARCH_CONFIGS = [
     {"model": "siglip", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
      "num_epochs": 20},
 
-    # ── CLIP-ViT-Large baselines ───────────────────────────────────────────  idx 91-93
-    # 91: CLIP-ViT-Large/14 baseline — 24-layer ViT, stronger than DINOv2-base
-    {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01},
-    # 92: + class weights
+    # ── CLIP-ViT-Large optimised configs ──────────────────────────────────  idx 91-93
+    # 91: unfreeze=2, LLRD=0.75, 30ep — DINOv2-Large sweet spot; image-text pretraining → shallow unfreeze
     {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
-     "use_class_weights": True},
-    # 93: more epochs
-    {"model": "clip_vit", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
-     "num_epochs": 20},
+     "llrd_factor": 0.75, "num_epochs": 30},
+    # 92: unfreeze=4, LLRD=0.75, 30ep — DINOv3 (same ViT-L arch) peaked at unfreeze=4; tests if arch > pretraining
+    {"model": "clip_vit", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 30},
+    # 93: unfreeze=4, LLRD=0.75, 50ep — extend best config; likely +0.5-1pp
+    {"model": "clip_vit", "unfreeze_blocks": 4, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.75, "num_epochs": 50},
 
     # ── DINOv2-Large best config + class weights ───────────────────────────  idx 94-95
     # 94: cfg-80 best (50ep, LLRD=0.75) + class weights — does balancing help large model?
@@ -403,6 +423,17 @@ SEARCH_CONFIGS = [
     # 119: unfreeze=4, lr=5e-5, 50ep — lower LR cross with deeper unfreeze + full epochs (~46min)
     {"model": "dinov3", "unfreeze_blocks": 4, "lr": 5e-5, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
      "llrd_factor": 0.75, "num_epochs": 50},
+
+    # ── CLIP-ViT extended search ───────────────────────────────────────────  idx 120
+    # 120: unfreeze=6, LLRD=0.65, 50ep — DINOv3-style deeper unfreeze; tests arch-driven behavior
+    {"model": "clip_vit", "unfreeze_blocks": 6, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05, "weight_decay": 0.01,
+     "llrd_factor": 0.65, "num_epochs": 50},
+
+    # ── SigLIP2-SO400M + upsampling ───────────────────────────────────────  idx 121
+    # 121: best SigLIP2 config (unfreeze=2, 20ep, LLRD=0.8) + upsample min=20
+    #      DINOv2-Large got +2.32pp from upsampling; SigLIP2 effect unknown
+    {"model": "siglip2_so400m", "unfreeze_blocks": 2, "lr": 1e-4, "scheduler": "linear", "label_smoothing": 0.05,
+     "weight_decay": 0.01, "llrd_factor": 0.8, "num_epochs": 20, "batch_size": 16, "upsample": True},
 ]
 # fmt: on
 
@@ -438,10 +469,14 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
     fold_models = []
     pooled_true = []
     pooled_pred = []
+    oof_logits  = np.zeros((len(full_dataset), num_labels), dtype=np.float32)
 
     for fold_idx, (train_idx, val_idx) in enumerate(fold_splits):
         signal("fold_start", config=cfg_index, fold=fold_idx + 1, n_folds=N_FOLDS, model=cfg["model"])
-        train_fold = full_dataset.select(train_idx).with_transform(train_tf)
+        train_raw  = full_dataset.select(train_idx)
+        if cfg.get("upsample", False):
+            train_raw = _upsample_to_minimum(train_raw, min_count=20)
+        train_fold = train_raw.with_transform(train_tf)
         val_fold   = full_dataset.select(val_idx).with_transform(val_tf)
 
         model = model_cfg["get_model"](num_labels, label2id, id2label)
@@ -529,6 +564,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         true  = preds_out.label_ids
         pooled_true.extend(true.tolist())
         pooled_pred.extend(preds.tolist())
+        oof_logits[val_idx] = preds_out.predictions.astype(np.float32)
 
         per_class = f1_score(true, preds, labels=all_label_ids, average=None, zero_division=0)
         fold_per_class_f1.append(per_class)
@@ -556,6 +592,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
     mean_per_class_f1 = np.mean(fold_per_class_f1, axis=0) if fold_per_class_f1 else np.zeros(num_labels)
     confusion_pairs = top_confusion_pairs(pooled_true, pooled_pred, class_names) if pooled_true else []
 
+    oof_probs = torch.softmax(torch.from_numpy(oof_logits), dim=-1).numpy()
     return (
         {m: float(np.mean([f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")},
         {m: float(np.std( [f[m] for f in fold_metrics])) for m in ("accuracy", "precision", "recall", "f1")},
@@ -564,6 +601,7 @@ def run_cv(cfg, model_cfg, full_dataset, fold_splits, class_names, num_labels, l
         fold_models,
         mean_per_class_f1,
         confusion_pairs,
+        oof_probs,
     )
 
 
@@ -616,6 +654,20 @@ def main():
 
     model_lookup = {cfg["name"]: cfg for cfg in MODELS}
 
+    # Load SigLIP2 baseline per-class F1 once for routing diff output
+    _baseline_f1 = None
+    _baseline_path = os.path.join("probs", "val_probs_siglip2_so400m_r013.npy")
+    _labels_path   = os.path.join("probs", "val_labels.npy")
+    if os.path.exists(_baseline_path) and os.path.exists(_labels_path):
+        import numpy as _np
+        from sklearn.metrics import f1_score as _f1_score
+        _bvp = _np.load(_baseline_path)
+        _bvl = _np.load(_labels_path)
+        _baseline_f1 = _f1_score(_bvl, _bvp.argmax(1),
+                                  labels=list(range(num_labels)), average=None, zero_division=0)
+        print(f"Routing baseline loaded: siglip2_so400m_r013 "
+              f"(solo acc={(_bvp.argmax(1)==_bvl).mean():.4f})")
+
     fieldnames = ["config", "model", "unfreeze_blocks", "lr", "scheduler",
                   "label_smoothing", "weight_decay", "llrd_factor",
                   "color_jitter", "randaugment", "random_erasing", "collator", "lora_r",
@@ -665,7 +717,7 @@ def main():
 
             model_cfg = model_lookup[cfg["model"]]
             try:
-                mean, std, mean_train_sec, mean_eval_sec, fold_models, mean_per_class_f1, confusion_pairs = run_cv(
+                mean, std, mean_train_sec, mean_eval_sec, fold_models, mean_per_class_f1, confusion_pairs, oof_probs = run_cv(
                     cfg, model_cfg, full_dataset, fold_splits,
                     class_names, num_labels, label2id, id2label,
                     cfg_index=i,
@@ -691,6 +743,30 @@ def main():
                     pc_writer.writerow(pc_row)
                 per_class_completed.add(i)
 
+            # ── routing diff vs SigLIP2 baseline ─────────────────────────────
+            ROUTING_DELTA = 0.10
+            KNOWN_HARD = [63, 70, 76, 78, 86, 87, 88, 68, 74]
+            if _baseline_f1 is not None:
+                deltas = mean_per_class_f1 - _baseline_f1
+                leads  = sorted([(j, float(mean_per_class_f1[j]), float(_baseline_f1[j]), float(deltas[j]))
+                                  for j in range(num_labels) if deltas[j] >= ROUTING_DELTA],
+                                 key=lambda x: x[3], reverse=True)
+                print(f"  Routing vs SigLIP2 (delta >= {ROUTING_DELTA}):", end="")
+                if leads:
+                    print(f"  {len(leads)} class(es) —")
+                    for j, this_f1, base_f1, d in leads:
+                        hard_tag = " [HARD]" if j in KNOWN_HARD else ""
+                        print(f"    class {j:>3}: this={this_f1:.3f}  base={base_f1:.3f}  delta={d:+.3f}{hard_tag}")
+                else:
+                    print("  none")
+                # Always show known hard classes
+                print(f"  Hard-class F1 (known problem classes):")
+                print(f"    {'cls':>4}  {'this':>6}  {'base':>6}  {'delta':>7}")
+                for j in KNOWN_HARD:
+                    d = float(deltas[j])
+                    marker = " <" if d >= ROUTING_DELTA else ""
+                    print(f"    {j:>4}  {mean_per_class_f1[j]:>6.3f}  {_baseline_f1[j]:>6.3f}  {d:>+7.3f}{marker}")
+
             # ── hard-class summary ────────────────────────────────────────────
             HARD_THRESHOLD = 0.5
             hard = [(j, class_names[j], mean_per_class_f1[j])
@@ -709,7 +785,7 @@ def main():
                 for c_a, c_b, n_err, rate in confusion_pairs[:5]:
                     print(f"    classes {c_a}<->{c_b}: {n_err:>3} errors, rate={rate:.2f}")
 
-            # ── generate Kaggle submission CSV ────────────────────────────
+            # ── generate Kaggle submission CSV + save prob arrays ─────────
             data_root = os.path.dirname(TRAIN_DIR)
             test_dir = os.path.join(data_root, "test")
             if os.path.isdir(test_dir) and fold_models:
@@ -729,6 +805,23 @@ def main():
                     for img_id, pred in zip(test_ids, test_preds):
                         writer_sub.writerow([img_id, int(class_names[int(pred)])])
                 print(f"  Submission saved: {sub_path}")
+
+                # save prob arrays for class_router.py
+                os.makedirs("probs", exist_ok=True)
+                _llrd_int = int(cfg.get("llrd_factor", 1.0) * 100)
+                _ep = cfg.get("num_epochs", NUM_EPOCHS)
+                prob_tag = f"{cfg['model']}_u{cfg['unfreeze_blocks']}_ep{_ep}_llrd{_llrd_int}_cfg{i}"
+                val_probs_path  = os.path.join("probs", f"val_probs_{prob_tag}.npy")
+                test_probs_path = os.path.join("probs", f"test_probs_{prob_tag}.npy")
+                np.save(val_probs_path, oof_probs)
+                test_probs = get_test_probs(fold_models, image_paths, val_tf)
+                np.save(test_probs_path, test_probs)
+                # save val labels once (used by class_router.py)
+                val_labels_path = os.path.join("probs", "val_labels.npy")
+                if not os.path.exists(val_labels_path):
+                    np.save(val_labels_path, np.array(full_dataset["label"]))
+                print(f"  Prob arrays saved: {val_probs_path}, {test_probs_path}")
+
                 del fold_models
                 torch.cuda.empty_cache()
 

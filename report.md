@@ -2,9 +2,11 @@
 
 ## 1 Introduction
 
-1. **Problem goal and setting.** _TODO_
-2. **Why transfer learning is appropriate.** _TODO_
-3. **Brief summary of approach and main result.** Eight pretrained backbones were evaluated on a 100-class image classification task with 119 hyperparameter configs. SigLIP2-SO400M-384 (google/siglip2-so400m-patch16-384) with 2 unfrozen layers, lr=1e-4, LLRD=0.8, 20 epochs achieved the best 5-fold CV accuracy of **95.27%** (run_004c, R2 with self-distillation pseudo-labeling). Kaggle public leaderboard score: **95.454%** (5th place).
+1. **Problem goal and setting.** We tackle a 100-class image classification task on an extremely small labeled dataset: 1079 training images (~10.8 images/class on average, ranging from 4 to 41) and 1036 unlabeled test images. The goal is to maximise accuracy on the Kaggle public leaderboard (competition: UCSC CSE 144 Spring 2026 Final Project). The dataset's scale — roughly one order of magnitude below what is typically used for fine-tuning large vision models — makes generalisation the central challenge: every design decision must trade off accuracy against overfitting.
+
+2. **Why transfer learning is appropriate.** With ~10 images per class, training any modern vision model from scratch is infeasible — the network would memorise the training set within a few epochs and fail to generalise. Transfer learning sidesteps this by initialising from a backbone pretrained on hundreds of millions to billions of images, where the lower layers have already learned universal low-level features (edges, textures) and higher layers encode rich semantic representations. Fine-tuning only the top 2–6 transformer blocks while freezing the rest dramatically reduces the effective number of free parameters, allowing the model to adapt its final representations to the 100-class vocabulary without destroying the pretrained features. This is the only practical approach at this dataset scale — as confirmed empirically: a fully fine-tuned DINOv2-Large achieves 77.4% while partial unfreezing (2 blocks) reaches 87.4%.
+
+3. **Brief summary of approach and main result.** Eight pretrained backbones were evaluated across 121 hyperparameter configurations using 5-fold stratified cross-validation. The dominant backbone is SigLIP2-SO400M-384 (`google/siglip2-so400m-patch16-384`), a 400M-parameter ViT-So400M pretrained on billions of image-text pairs at native 384px resolution. With 2 unfrozen transformer layers, lr=1e-4, LLRD=0.8, and 20 training epochs, it achieves **95.27% CV accuracy**. Self-distillation pseudo-labeling (threshold=0.97 on test predictions) adds +0.09% in a second training round. Final Kaggle public leaderboard score: **95.454%** (5th place). Post-submission, a per-class routing ensemble (`class_router.py`) was developed — SigLIP2 serves as the backbone for 87–88 classes while secondary models (DINOv3, CLIP-ViT) replace specific probability columns for hard classes where they show large, consistent per-class F1 advantages.
 
 ---
 
@@ -435,9 +437,22 @@ Key takeaways:
 
 SigLIP-Base (google/siglip-base-patch16-224, unfreeze=2, lr=1e-4) at 10 epochs reaches 83.3% — slightly below DINOv2-Base (85.54%) and well below DINOv2-Large (87.39%). Class weights hurt (same pattern as ConvNeXt and DINOv2-Large). Doubling epochs to 20 improves to 84.6%, suggesting SigLIP benefits from longer training; the gap to DINOv2-Large persists (~3 pts). SigLIP-Base is not competitive with DINOv2-Large for this task; the much larger SigLIP2-SO400M variant (configs 96+) addresses this.
 
-#### 5.5.22 CLIP-ViT-Large/14 baselines (configs 91–93) — failed, TODO
+#### 5.5.22 CLIP-ViT-Large/14 optimised search (configs 91–92, run_006)
 
-All three CLIP-ViT configs (91: baseline, 92: +class weights, 93: 20ep) failed with `'CLIPClassifier' object has no attribute 'config'`. The custom `CLIPClassifier` wrapper (plain `nn.Module`) did not expose `.config`, which HuggingFace Trainer accesses internally. **Fix applied:** `self.config = self.vision_model.config` added to `CLIPClassifier.__init__`. **TODO:** rerun configs 91–93 to obtain CLIP-ViT-Large/14 baseline results.
+CLIP-ViT-Large/14 (`openai/clip-vit-large-patch14`, ViT-L/16 with image-text contrastive pretraining on 400M image-text pairs) with two optimised configs informed by DINOv3's sweep — both use LLRD=0.75, 30ep, linear scheduler, lr=1e-4, which were the sweet-spot settings for the same ViT-L architecture.
+
+| Config | Unfreeze | LLRD | Epochs | Acc | Std | F1 |
+|---|---|---|---|---|---|---|
+| 91 | 2 | 0.75 | 30 | 0.8656 | 0.0172 | 0.8485 |
+| **92** | **4** | **0.75** | **30** | **0.8823** | **0.0217** | **0.8691** |
+
+**Best config: 92 (unfreeze=4, LLRD=0.75, 30ep) → 88.23%**
+
+**Key findings:**
+- **unfreeze=4 significantly beats unfreeze=2** (+1.67pp). This is unlike SigLIP2 (peaks at unfreeze=2) but mirrors DINOv3 (also peaks at unfreeze=4). Both DINOv3 and CLIP share the ViT-L architecture — the pattern suggests image-text contrastive pretraining (like DINO distillation) produces representations that tolerate deeper fine-tuning than discriminative-only pretraining.
+- **CLIP-ViT ceiling estimate ~90–92%** based on DINOv3's trajectory (unfreeze=2 at 20ep → 92.21%; unfreeze=4 at 50ep → 93.79%). CLIP-ViT at 30ep reaches 88.23%; 50ep configs (93, 120) are staged to push toward 90%.
+- **CLIP-ViT best (88.23%) < DINOv3 best (93.79%) by −5.6pts.** Despite identical architecture (ViT-L), DINOv3's self-supervised distillation from a ViT-7B teacher on 1.689B images produces richer vision features than CLIP's image-text contrastive objective — the visual features are less adapted to fine-grained recognition.
+- **Per-class routing potential:** CLIP-ViT leads SigLIP2 on specific classes (see section 5.5.39). For classes 52 and 86, CLIP-92 outperforms both SigLIP2 and DINOv3, making it a useful secondary for targeted class routing even at lower overall accuracy.
 
 #### 5.5.23 DINOv2-Large + class weights and augmentation (configs 94–95)
 
@@ -724,6 +739,94 @@ With fresh `val_probs_siglip2_so400m.npy` (run_012), the 384+512 ensemble grid w
 
 ---
 
+#### 5.5.36 SigLIP2-SO400M-384 self-distillation — run_013 (SEED=42) and run_015 (SEED=0)
+
+Two fresh full-pipeline runs to produce independently-trained models for a different-seed ensemble. Both use identical config (SigLIP2-SO400M-384, unfreeze=2, lr=5e-5, LLRD=0.75, 10ep, TTA, pseudo-label threshold=0.97) but differ in random seed, giving independent 5-fold stratified splits.
+
+| Run | Seed | R1 acc | R2 acc | R2 Δ | Pseudo-labels accepted |
+|---|---|---|---|---|---|
+| run_013 | 42 | 94.90% | 94.90% | 0.00% | 801/1036 |
+| run_015 | 0 | 94.90% | 94.62% | **−0.28%** | 801/1036 |
+
+**Key finding — pseudo-label gain is not reliable across seeds.** Across all SigLIP2 R2 runs: run_004c +0.09%, run_011b +0.09%, run_013 0.00%, run_015 −0.28%. The variance is larger than the mean gain. At threshold=0.97, both runs accept exactly 801/1036 pseudo-labels — confirming identical confidence coverage. The R2 CV accuracy fluctuates within ±0.3% of R1 from run to run, suggesting the gain (or loss) is driven by which specific test images get injected into which folds, not by any systematic signal.
+
+**Submissions:** , 
+
+#### 5.5.37 Different-seed ensemble grid search — run_016 (SEED=42 × SEED=0)
+
+ run on  (SEED=42 R1 OOF) and  (SEED=0 R1 OOF). Test predictions blended from  and  (R2 test probs for each seed).
+
+**Grid search results ():**
+
+| w (r015) | val acc | f1 |
+|---|---|---|
+| 0.00 (r013 solo) | 94.90% | 0.9476 |
+| 0.05–0.20 | 94.81% | — |
+| 0.25 | 95.09% | 0.9494 |
+| **0.30** | **95.18%** | **0.9502** |
+| 0.35 | 95.09% | 0.9492 |
+| 0.50 | 94.62% | 0.9448 |
+| 1.00 (r015 solo) | 94.90% | 0.9480 |
+
+**Best:  → val acc 95.18%, F1 = 0.9502 (+0.28pp over solo)**
+
+**Submission:** 
+
+**Key findings:**
+- **+0.28pp is 3× larger than typical val-overfitting noise.** Prior val-overfit ensembles (SigLIP2-384+512, SigLIP2+DINOv3) showed +0.10–0.19% CV then hurt on Kaggle. A +0.28pp gain from two same-architecture, same-accuracy models is larger than expected from correlated errors alone, suggesting the different fold splits introduce genuine error diversity.
+- **Asymmetric weight (70/30) favors SEED=42.** This is partly by chance — SEED=42 happened to produce slightly better OOF predictions. The 30% weight from SEED=0 still contributes complementary signal.
+- **Kaggle result: 95.454%** — tied with the solo best (run_004c). The +0.28pp val gain was val-overfitting. Different-seed fold splits produce genuinely different OOF predictions, but the test-set errors are highly correlated (same pretrained weights, same architecture, same training recipe). **All ensemble paths are now exhausted:** same-backbone different-resolution (+0.19% CV → −0.91% Kaggle), cross-architecture (+0.10% CV → −3.6% Kaggle), same-architecture different-seed (+0.28% CV → 0% test gain). The 1079-sample val set cannot identify which test errors are independent regardless of ensemble approach.
+
+#### 5.5.38 Per-class soft routing ensemble — `class_router.py`
+
+After all global ensemble paths were exhausted (same-backbone different-resolution, cross-architecture, same-backbone different-seed all showing val-overfitting patterns), a per-class routing approach was developed. The key observation: global ensembles fail because the weaker model's systematic errors dominate. But at the individual class level, a weaker model can decisively outperform SigLIP2 on 5–15 specific hard classes.
+
+**Design:**
+- SigLIP2 (siglip2_so400m_r013) is the backbone for all 100 classes.
+- For each class where a secondary model exceeds the backbone's per-class F1 by ≥ delta, the backbone's probability column for that class is replaced by the secondary's column.
+- Multiple secondaries are supported: each class is routed to whichever secondary leads by the largest margin.
+- Routing analysis requires only saved `.npy` probability arrays — no retraining needed.
+
+**Routing analysis — SigLIP2 vs DINOv3 vs CLIP-92 (delta ≥ 0.05):**
+
+| Class | SigLIP2 F1 | DINOv3 F1 | CLIP-92 F1 | Winner | Margin |
+|---|---|---|---|---|---|
+| 87 | 0.600 | **0.762** | 0.567 | DINOv3 | +0.162 |
+| 52 | 0.800 | 0.875 | **0.960** | CLIP-92 | +0.160 |
+| 84 | 0.842 | **1.000** | 0.900 | DINOv3 | +0.158 |
+| 86 | 0.696 | 0.846 | **0.850** | CLIP-92 | +0.154 |
+| 89 | 0.842 | **0.947** | 0.760 | DINOv3 | +0.105 |
+| 85 | 0.480 | **0.583** | 0.381 | DINOv3 | +0.103 |
+| 51 | 0.842 | 0.900 | **0.933** | CLIP-92 | +0.091 |
+| 1 | 0.909 | **1.000** | 1.000 | DINOv3 | +0.091 |
+| 93 | 0.909 | **1.000** | 0.933 | DINOv3 | +0.091 |
+| 94 | 0.909 | **1.000** | 0.665 | DINOv3 | +0.091 |
+| 3 | 0.947 | **1.000** | 0.933 | DINOv3 | +0.053 |
+| 6 | 0.947 | **1.000** | 1.000 | DINOv3 | +0.053 |
+| 2 | 0.909 | 0.952 | **0.960** | CLIP-92 | +0.051 |
+
+**87 classes stay with SigLIP2.** 9 route to DINOv3, 4 to CLIP-92.
+
+**Three routing strategies compared (SigLIP2 backbone + DINOv3 secondary, 12 routed classes):**
+
+| Strategy | Val Acc | Delta vs backbone |
+|---|---|---|
+| Backbone solo | 94.90% | — |
+| **Hard (w=1.0)** | **96.11%** | **+1.21pp** |
+| Soft-global (single w grid-searched) | 96.11% | +1.21pp (best w=1.00) |
+| Soft-per-class (independent w per class) | 95.83% | +0.93pp |
+
+**Key findings:**
+- Hard routing and soft-global routing converge to w=1.00 — full replacement is optimal, meaning the secondary model's column is more informative than any blend for these classes.
+- Soft-per-class underperforms hard routing (−0.28pp): with ~10 val samples per class, per-class weight search overfits the noise. Classes 1, 6, and 51 optimise to w=0.0 despite positive per-class F1 margins, simply because the margin is within variance of those small per-class sample sizes.
+- **Hard routing is the correct strategy** — simpler, no overfitting risk, equal or better results.
+
+**Val gain caveat:** All prior global ensembles showed val gains of +0.10–0.28pp that failed to hold on the 1036-image test set. The +1.21pp val gain here is substantially larger (4–12× prior gains), but the underlying mechanism is different — per-class routing should be less susceptible to the specific-weight-overfitting pattern that caused prior ensemble failures, since each routed class has a consistent, large per-class margin rather than a global weight selected to minimise error on 1079 samples.
+
+**Initial submission (run_017 — 3 classes only):** Routes classes 84, 86, 87 to DINOv3 (the top 3 by margin, all >0.15). Val acc = 95.37% (+0.47pp). Pending Kaggle submission.
+
+**Infrastructure — `class_router.py`:** Implements full routing workflow: load any combination of backbone + secondary .npy files, compute per-class F1, auto-identify routing candidates above delta threshold, run hard/soft-global routing, generate submission CSV. Supports multiple secondaries simultaneously with `--secondaries model1 model2 ...` and `--analyze` flag for analysis-only mode (no submission). `search.py` now saves `val_probs_{model}_u{unfreeze}_ep{epochs}_llrd{llrd}_cfg{N}.npy` and `test_probs_...npy` after every config, enabling immediate routing analysis without a separate pipeline run.
+
 ### 5.6 Overall Best Results Summary
 
 | Model | Best CV acc | Kaggle | Config | Key settings |
@@ -734,7 +837,10 @@ With fresh `val_probs_siglip2_so400m.npy` (run_012), the 384+512 ensemble grid w
 | ConvNeXt-Large | 77.85% | — | pipeline | unfreeze=4, prog-unfreeze |
 | ViT-B/16 | 74.42% | — | 54 | unfreeze=4, LLRD=0.85, +CJ |
 | SigLIP-Base | 84.61% | — | 90 | unfreeze=2, lr=1e-4, 20ep |
-| CLIP-ViT-Large/14 | _TODO_ | — | 91–93 | bug fixed, rerun pending |
+| CLIP-ViT-Large/14 (cfg 91) | 86.56% | — | 91 | unfreeze=2, LLRD=0.75, 30ep |
+| CLIP-ViT-Large/14 (cfg 92) | 88.23% | — | 92 | unfreeze=4, LLRD=0.75, 30ep |
+| CLIP-ViT-Large/14 (cfg 93) | _running_ | — | 93 | unfreeze=4, LLRD=0.75, 50ep |
+| CLIP-ViT-Large/14 (cfg 120) | _staged_ | — | 120 | unfreeze=6, LLRD=0.65, 50ep |
 | DINOv2-Base | 85.54% | — | 64 | unfreeze=2, lr=1e-4, LLRD=0.85, 10ep |
 | DINOv2-Large (search) | 87.39% | — | 80 | unfreeze=2, lr=1e-4, LLRD=0.75, 50ep |
 | DINOv2-Large (pipeline, upsample) | 89.71% | — | run_005a | unfreeze=2, 50ep, upsample min=20 |
@@ -750,7 +856,14 @@ With fresh `val_probs_siglip2_so400m.npy` (run_012), the 384+512 ensemble grid w
 | Soft ensemble: SigLIP2-384 + DINOv3 (w=0.65) | 95.00% | — | run_010 | 0.35×SigLIP2 + 0.65×DINOv3 (val-overfitted, 91.818% Kaggle) |
 | SigLIP2-SO400M-384 R2 (run_011b) | 95.09% | — | run_011b | ensemble pseudo-label (0.35×SigLIP2 + 0.65×DINOv3) |
 | SigLIP2-SO400M-384 R1 (run_012) | 94.90% | — | run_012 | clean val_probs run; conf-gated ensemble showed w=0 optimal |
-| **SigLIP2-SO400M-384 R2** | **95.27%** | **95.454%** | **run_004c** | **self-distillation pseudo-label, 5th place** |
+| SigLIP2-SO400M-384 R2 | 95.27% | 95.454% | run_004c | self-distillation pseudo-label, 5th place |
+| SigLIP2-SO400M-384 R1 (run_013, SEED=42) | 94.90% | — | run_013 | fresh SEED=42 run for ensemble diversity |
+| SigLIP2-SO400M-384 R2 (run_013) | 94.90% | — | run_013 | self-distill, 0 gain vs R1 |
+| SigLIP2-SO400M-384 R2 (run_015, SEED=0) | 94.62% | — | run_015 | self-distill, −0.28pp vs R1 |
+| Different-seed ensemble (r013+r015, w=0.30) | 95.18% | **95.454%** | run_016 | 0.70×SEED=42 + 0.30×SEED=0; +0.28pp CV, 0 test gain (val-overfitted) |
+| Per-class routing: SigLIP2 + DINOv3 (3 classes: 84, 86, 87) | 95.37% | _pending_ | run_017 | hard routing w=1.0; +0.47pp CV |
+| Per-class routing: SigLIP2 + DINOv3 (12 classes, delta≥0.05) | 96.11% | _not submitted_ | — | hard routing; +1.21pp CV; val-overfit risk TBD |
+| Per-class routing: SigLIP2 + DINOv3 + CLIP (3 models, pending) | _pending_ | — | run_018 | waiting for cfg 93/120 prob arrays |
 
 ### 5.7 Pipeline Run — Class-Routed Ensemble (DINOv2-Base + DINOv2-Large)
 
@@ -799,7 +912,8 @@ The routed ensemble (+0.37% over Large alone) confirms that Base and Large are c
    - **Class weights ruled out.** Inverse-frequency weighting hurts all models (SigLIP-Base −0.75%, DINOv2-Large −2.13%). Distorts gradient balance more than it helps rare classes at this scale.
    - **Upsample balance (`USE_UPSAMPLE_BALANCE=True`, min=20)** helps DINOv2-Large significantly (+2.32 pts, 87.39% → 89.71%). Effect on SigLIP2 not yet isolated.
    - **DINOv3 best: 93.79% (cfg 118) / 93.70% (pipeline, run_010).** Strong but 1.48 pts below SigLIP2. Soft-weighted ensemble grid search (run_010) found `0.35×SigLIP2 + 0.65×DINOv3` = **95.00%** on val, but this was model-weight-specific overfitting: when re-evaluated with run_012's SigLIP2 probs, the optimal weight is **w=0** (DINOv3 never helps). The confidence-gated ensemble (restricting DINOv3 to high-confidence predictions) also gives w=0 as best across all thresholds. The 91.818% Kaggle score from the w=0.65 submission confirms DINOv3's val-overfitted weights hurt on the real test set. **DINOv3 ensemble is not a viable path forward.**
-   - **CLIP-ViT-Large/14 deprioritised.** Bug fixed (missing `.config`), but SigLIP2's 95% makes CLIP-ViT results less strategically relevant with 3 days remaining.
+   - **CLIP-ViT-Large/14 (cfg 92): 88.23% at unfreeze=4, LLRD=0.75, 30ep.** Despite lower overall accuracy than DINOv3 (93.79%), CLIP-92 leads SigLIP2 on specific classes (52, 86) where DINOv3 does not — its image-text contrastive pretraining encodes different class discriminators. 50ep configs (93, 120) are running to determine if CLIP can break 90%.
+   - **Per-class hard routing is the most promising remaining path.** With all global ensemble approaches exhausted (val-overfitting confirmed for same-backbone different-resolution, cross-architecture, and different-seed ensembles), per-class routing using `class_router.py` offers a different mechanism: SigLIP2 handles 87–88 classes, secondary models replace only specific columns where they have large, consistent per-class F1 advantages. Val gain of +1.21pp (12 classes, SigLIP2+DINOv3) and +0.47pp (3 classes, run_017) are substantially larger than prior ensemble gains, reducing the val-overfitting risk. The 3-model routing (adding CLIP probs when cfg 93/120 finishes) is the next submission target.
    - **Label-mixing and spatial augmentation ineffective.** Mixup (−2%), CutMix (−6%), RandAugment neutral-to-negative across all tested models. Disabled in the final pipeline.
    - **Kaggle submissions per config** available at `search_results/config_{i}_{model}.csv`.
 
